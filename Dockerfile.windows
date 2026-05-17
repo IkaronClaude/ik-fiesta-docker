@@ -1,0 +1,79 @@
+# Fiesta Online server runtime -- Windows variant
+#
+# Generic bring-your-own-binaries image. Contains NO copyrighted server files.
+# At runtime, mount your Fiesta server folder (the one with 9Data\, Zone01\,
+# Account\, GamigoZR\, ...) at C:\fiesta, and pass the exe as the trailing arg.
+#
+# Example:
+#   docker run --rm `
+#     -v C:\path\to\fiesta-server:C:\fiesta `
+#     -v C:\path\to\per-container\serverinfo:C:\fiesta\9Data\ServerInfo `
+#     ghcr.io/<you>/fiesta-server-runtime:latest `
+#     Login\Login.exe
+#
+# Build prerequisites (Docker Desktop must be in Windows-container mode):
+#   set DOCKER_BUILDKIT=0
+#   docker build -f Dockerfile.windows -t fiesta-server-runtime:windows .
+#
+# See deploy/runtime/README.md for the full interface.
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+
+# VC++ 2015-2022 Redistributable x86 -- Fiesta server exes are 32-bit.
+RUN Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x86.exe' \
+      -OutFile C:/vc_redist_x86.exe ; \
+    Start-Process -FilePath C:/vc_redist_x86.exe \
+      -ArgumentList '/install', '/quiet', '/norestart' -Wait ; \
+    Remove-Item C:/vc_redist_x86.exe
+
+# ODBC Driver 17 for SQL Server.
+RUN Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2266337' \
+      -OutFile C:/msodbcsql.msi ; \
+    Start-Process msiexec.exe \
+      -ArgumentList '/i', 'C:/msodbcsql.msi', '/quiet', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES' \
+      -Wait ; \
+    Remove-Item C:/msodbcsql.msi
+
+COPY start.ps1 C:/start.ps1
+
+# --- Runtime interface (override at `docker run`) ---
+# FIESTA_PATH     Mount point for the user's server folder. Default: C:\fiesta.
+# FIESTA_EXE      Relative path under FIESTA_PATH to the exe to launch, e.g.
+#                 "Zone01\Zone.exe" or "Login\Login.exe". REQUIRED.
+#                 Can be passed as an env var OR as the trailing CMD arg
+#                 (`docker run ... fiesta-server-runtime Login\Login.exe`).
+# PUBLIC_IP       Optional. If set, the IP field in every SERVER_INFO row whose
+#                 trailing comment marker is "PUBLIC_IP" (the client-facing rows)
+#                 is rewritten to this value. LOCALHOST-tagged rows are left as
+#                 127.0.0.1. Labels and ports are never touched.
+# SQL_HOST        SQL Server hostname for ODBC rewrites. Default: 127.0.0.1.
+# SQL_PORT        SQL Server port. Default: 1433.
+# SA_PASSWORD     Optional. If set, replaces PWD= values in ODBC_INFO rows.
+# ODBC_DRIVER     ODBC driver name inserted into DRIVER={...}. Default on Windows:
+#                 "ODBC Driver 17 for SQL Server" (installed in this image).
+# START_GAMIGOZR  "auto" (start GamigoZR if the target exe is Zone.exe -- default),
+#                 "1" (always start), "0" (never start).
+# GAMIGOZR_DIR    Subdir under FIESTA_PATH containing GamigoZR.exe. Default: GamigoZR.
+# SERVICE_NAME    Optional override for the Windows service name (default: _<dirname>).
+# KEEP_ALIVE      "1" -> keep container alive after the game process exits (for
+#                 `docker exec` debugging). Default: "0" (container exits with process).
+ENV FIESTA_PATH=C:\\fiesta \
+    FIESTA_EXE="" \
+    PUBLIC_IP="" \
+    SQL_HOST=127.0.0.1 \
+    SQL_PORT=1433 \
+    SA_PASSWORD="" \
+    ODBC_DRIVER="ODBC Driver 17 for SQL Server" \
+    START_GAMIGOZR=auto \
+    GAMIGOZR_DIR=GamigoZR \
+    SERVICE_NAME="" \
+    KEEP_ALIVE=0
+
+LABEL org.opencontainers.image.title="fiesta-server-runtime" \
+      org.opencontainers.image.description="Bring-your-own runtime for Fiesta Online server binaries (Windows)" \
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+
+USER ContainerAdministrator
+ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/start.ps1"]

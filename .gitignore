@@ -1,0 +1,14 @@
+# Example stack runtime state
+example/serverinfo/
+example/.env
+.env
+
+# Build artefacts
+*.tar
+*.tar.gz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

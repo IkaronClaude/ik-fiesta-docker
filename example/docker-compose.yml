@@ -1,0 +1,266 @@
+# Full Fiesta server stack -- uses fiesta-server-runtime against a raw
+# ServerSource-shaped tree without modifying it.
+#
+# Required environment (e.g. via .env file next to this docker-compose.yml):
+#   FIESTA_SERVER=/path/to/your/Server     (top of the tree with 9Data/, Login/, ...)
+#   SA_PASSWORD=YourStrongPassword1
+#
+# Optional:
+#   PUBLIC_IP=your.public.ip               (only needed for external clients)
+#
+# What this brings up:
+#   sqlserver   -- Microsoft SQL Server 2022 (Linux image)
+#   account / accountlog / character / gamelog  -- DB bridge processes
+#   login       -- Login service
+#   worldmanager -- WM
+#   zone00..zone04 -- map zones
+#   gamigozr    -- shared anti-cheat HTTP service
+#
+# All game services share the host's network namespace, so 127.0.0.1 + the
+# ports baked into the default ServerInfo.txt Just Work. The only rewrites the
+# runtime image performs against your ServerSource are:
+#   * ODBC SERVER=.\SQLEXPRESS   -> SERVER=127.0.0.1,1433
+#   * ODBC PWD=<hardcoded>       -> PWD=${SA_PASSWORD}
+#   * (if PUBLIC_IP is set) SERVER_INFO rows tagged "; PUBLIC_IP" get rewritten
+
+x-fiesta-env: &fiesta-env
+  SA_PASSWORD: "${SA_PASSWORD:?SA_PASSWORD not set. Put it in a .env file.}"
+  SQL_HOST: "127.0.0.1"
+  SQL_PORT: "${SQL_PORT:-1433}"
+  PUBLIC_IP: "${PUBLIC_IP:-}"
+  KEEP_ALIVE: "${KEEP_ALIVE:-0}"
+
+x-fiesta: &fiesta
+  image: fiesta-server-runtime:latest
+  restart: on-failure
+  network_mode: host
+
+services:
+  # --- One-shot: populate per-container 9Data/ServerInfo overlays ---
+  # _ServerGroup.txt needs to be individually writable per game service, and
+  # ServerInfo.txt is rewritten per container -- so each service gets its own
+  # writable copy of 9Data/ServerInfo/. This service seeds those copies from
+  # FIESTA_SERVER on the first run, then exits.
+  init:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - ${FIESTA_SERVER:?FIESTA_SERVER not set. Put it in a .env file.}:/source:ro
+      - ./serverinfo:/dest
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        for svc in account accountlog character gamelog login worldmanager \
+                   zone00 zone01 zone02 zone03 zone04 gamigozr; do
+          mkdir -p /dest/$$svc
+          if [ -z "$$(ls -A /dest/$$svc 2>/dev/null)" ]; then
+            cp -r /source/9Data/ServerInfo/. /dest/$$svc/
+            echo "init: populated /dest/$$svc"
+          fi
+        done
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: on-failure
+    network_mode: host
+    environment:
+      MSSQL_SA_PASSWORD: "${SA_PASSWORD:?SA_PASSWORD not set}"
+      ACCEPT_EULA: "Y"
+    volumes:
+      - sql-data:/var/opt/mssql
+      - ${FIESTA_SERVER:?}/Databases:/var/opt/mssql/backup
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # --- Shared anti-cheat (HTTP service all zones connect to) ---
+  gamigozr:
+    <<: *fiesta
+    command: ["GamigoZR/GamigoZR.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/gamigozr:/fiesta/9Data/ServerInfo
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  # --- DB bridge processes ---
+  account:
+    <<: *fiesta
+    command: ["Account/Account.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/account:/fiesta/9Data/ServerInfo
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  accountlog:
+    <<: *fiesta
+    command: ["AccountLog/AccountLog.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/accountlog:/fiesta/9Data/ServerInfo
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  character:
+    <<: *fiesta
+    command: ["Character/Character.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/character:/fiesta/9Data/ServerInfo
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  gamelog:
+    <<: *fiesta
+    command: ["GameLog/GameLog.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/gamelog:/fiesta/9Data/ServerInfo
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  # --- Game processes ---
+  login:
+    <<: *fiesta
+    command: ["Login/Login.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/login:/fiesta/9Data/ServerInfo
+    depends_on:
+      account:
+        condition: service_started
+      accountlog:
+        condition: service_started
+      character:
+        condition: service_started
+      gamelog:
+        condition: service_started
+
+  worldmanager:
+    <<: *fiesta
+    command: ["WorldManager/WorldManager.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/worldmanager:/fiesta/9Data/ServerInfo
+    depends_on:
+      account:
+        condition: service_started
+      accountlog:
+        condition: service_started
+      character:
+        condition: service_started
+      gamelog:
+        condition: service_started
+
+  # --- Zones (depend on WorldManager + GamigoZR) ---
+  zone00:
+    <<: *fiesta
+    command: ["Zone00/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/zone00:/fiesta/9Data/ServerInfo
+    depends_on:
+      worldmanager:
+        condition: service_started
+      gamigozr:
+        condition: service_started
+
+  zone01:
+    <<: *fiesta
+    command: ["Zone01/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/zone01:/fiesta/9Data/ServerInfo
+    depends_on:
+      worldmanager:
+        condition: service_started
+      gamigozr:
+        condition: service_started
+
+  zone02:
+    <<: *fiesta
+    command: ["Zone02/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/zone02:/fiesta/9Data/ServerInfo
+    depends_on:
+      worldmanager:
+        condition: service_started
+      gamigozr:
+        condition: service_started
+
+  zone03:
+    <<: *fiesta
+    command: ["Zone03/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/zone03:/fiesta/9Data/ServerInfo
+    depends_on:
+      worldmanager:
+        condition: service_started
+      gamigozr:
+        condition: service_started
+
+  zone04:
+    <<: *fiesta
+    command: ["Zone04/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:/fiesta
+      - ./serverinfo/zone04:/fiesta/9Data/ServerInfo
+    depends_on:
+      worldmanager:
+        condition: service_started
+      gamigozr:
+        condition: service_started
+
+volumes:
+  sql-data:

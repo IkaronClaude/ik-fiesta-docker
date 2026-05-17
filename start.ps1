@@ -1,0 +1,402 @@
+# Fiesta Online server runtime -- Windows entrypoint.
+#
+# Contract (see Dockerfile.windows for env-var docs):
+#   FIESTA_PATH       mount point of the user's server folder (default: C:\fiesta)
+#   FIESTA_EXE        relative path to the exe, e.g. "Zone01\Zone.exe"
+#                     If unset, the first positional arg is used.
+#   PUBLIC_IP         if set, replaces the IP in SERVER_INFO rows whose trailing
+#                     comment says "PUBLIC_IP" (clients use these rows)
+#   SQL_HOST          SQL Server host        (default: 127.0.0.1)
+#   SQL_PORT          SQL Server port        (default: 1433)
+#   SA_PASSWORD       if set, replaces PWD= in ODBC_INFO rows
+#   ODBC_DRIVER       ODBC driver name in DRIVER={...}
+#                     (default: "ODBC Driver 17 for SQL Server" -- installed in image)
+#   START_GAMIGOZR    auto | 1 | 0           (default: auto -- on for Zone.exe)
+#   GAMIGOZR_DIR      subdir under FIESTA_PATH (default: GamigoZR)
+#   SERVICE_NAME      override service name (default: _<dirname>)
+#   KEEP_ALIVE        1 -> keep container alive after process exits
+
+$ErrorActionPreference = 'Continue'
+
+$fiestaPath    = if ($env:FIESTA_PATH)    { $env:FIESTA_PATH }    else { 'C:\fiesta' }
+$fiestaExe     = $env:FIESTA_EXE
+$startGamigoZR = if ($env:START_GAMIGOZR) { $env:START_GAMIGOZR } else { 'auto' }
+$gamigoZRDir   = if ($env:GAMIGOZR_DIR)   { $env:GAMIGOZR_DIR }   else { 'GamigoZR' }
+$keepAlive     = $env:KEEP_ALIVE -eq '1'
+$publicIp      = $env:PUBLIC_IP
+$sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.0.1' }
+$sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' }
+$saPassword    = $env:SA_PASSWORD
+$odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'ODBC Driver 17 for SQL Server' }
+
+# Accept FIESTA_EXE from env var OR first positional arg.
+if (-not $fiestaExe -and $args.Count -ge 1) {
+    $fiestaExe = $args[0]
+}
+if (-not $fiestaExe) {
+    Write-Error "No exe specified."
+    Write-Host  "  Pass it as the trailing arg, e.g.:"
+    Write-Host  "    docker run fiesta-server-runtime Login\Login.exe"
+    Write-Host  "  or as an env var: -e FIESTA_EXE=Login\Login.exe"
+    exit 1
+}
+
+# Normalise: accept "Zone01/Zone.exe" (POSIX-style) too.
+$fiestaExe = $fiestaExe -replace '/', '\'
+
+$processRelDir = Split-Path $fiestaExe -Parent
+$processExe    = Split-Path $fiestaExe -Leaf
+$processDir    = Join-Path $fiestaPath $processRelDir
+$exePath       = Join-Path $processDir $processExe
+$dirName       = Split-Path $processRelDir -Leaf
+
+$serviceName = if ($env:SERVICE_NAME) { $env:SERVICE_NAME } else { "_$dirName" }
+
+if (-not (Test-Path $fiestaPath -PathType Container)) {
+    Write-Error "FIESTA_PATH ($fiestaPath) is not a directory. Mount your server folder, e.g.: -v C:\host\fiesta-server:$fiestaPath"
+    exit 1
+}
+
+if (-not (Test-Path $exePath -PathType Leaf)) {
+    Write-Error "Exe not found: $exePath"
+    Write-Host  "  FIESTA_PATH = $fiestaPath"
+    Write-Host  "  FIESTA_EXE  = $fiestaExe"
+    if (Test-Path $fiestaPath) {
+        Write-Host "  Directory listing:"
+        Get-ChildItem $fiestaPath -Force | ForEach-Object { Write-Host ("    {0}" -f $_.Name) }
+    }
+    exit 1
+}
+
+Write-Host "=== Fiesta runtime (Windows) ==="
+Write-Host "  Server folder : $fiestaPath"
+Write-Host "  Process dir   : $processDir"
+Write-Host "  Exe           : $processExe"
+Write-Host "  Service name  : $serviceName"
+
+# --- Auto-rewrite included config files ---
+# The default ServerSource ServerInfo.txt hardcodes 127.0.0.1, .\SQLEXPRESS,
+# and a known default SQL password. Walk the #include graph from the per-process
+# config dir and rewrite the targets in place:
+#   * SERVER_INFO rows whose trailing comment is "PUBLIC_IP" get their IP
+#     replaced with $PUBLIC_IP (only if set). LOCALHOST rows stay 127.0.0.1.
+#     Labels and ports are never touched.
+#   * ODBC_INFO rows get .\SQLEXPRESS rewritten to ${SQL_HOST},${SQL_PORT},
+#     PWD= rewritten to ${SA_PASSWORD} if set, and DRIVER={SQL Server} swapped
+#     to DRIVER={${ODBC_DRIVER}} (Windows containers don't ship the legacy
+#     {SQL Server} driver -- ODBC Driver 17 is the modern equivalent).
+#
+# Operators who don't want any rewriting: leave PUBLIC_IP and SA_PASSWORD unset
+# and have your ODBC strings already point at a working server -- this script
+# becomes a no-op for the config files.
+#
+# The included files must be writable. The standard pattern is to overlay-mount
+# 9Data\ServerInfo\ as a per-container directory so the rewrite doesn't race
+# with other containers reading/writing the same file -- see README.
+
+function Get-IncludePaths {
+    param([string]$cfgDir)
+    $result = @{}
+    if (-not (Test-Path $cfgDir)) { return @() }
+    Get-ChildItem -Path $cfgDir -Filter '*.txt' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $txt = [System.IO.File]::ReadAllText($_.FullName)
+        $matches = [regex]::Matches($txt, '(?m)^\s*#include\s+"([^"]+)"')
+        foreach ($m in $matches) {
+            $rel = $m.Groups[1].Value -replace '/', '\'
+            $abs = if ([System.IO.Path]::IsPathRooted($rel)) {
+                $rel
+            } else {
+                [System.IO.Path]::GetFullPath((Join-Path (Split-Path $_.FullName -Parent) $rel))
+            }
+            $result[$abs] = $true
+        }
+    }
+    return $result.Keys
+}
+
+function Rewrite-ConfigFile {
+    param([string]$file)
+
+    if (-not (Test-Path $file -PathType Leaf)) {
+        Write-Host "  WARN: included file not found: $file"
+        return
+    }
+
+    $rawText = [System.IO.File]::ReadAllText($file)
+    $eol = if ($rawText -match "`r`n") { "`r`n" } else { "`n" }
+    # Splits on either CRLF or LF; final element is "" if file ends with newline.
+    $lines = $rawText -split "`r?`n"
+
+    $changed = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+
+        if ($line -match '^\s*SERVER_INFO\s' -and $publicIp) {
+            # Only rewrite rows tagged ; PUBLIC_IP (client-facing).
+            if ($line -match ';.*PUBLIC_IP') {
+                if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"[^"]*)"([^"]+)"(.*)$') {
+                    $existing = $Matches[2]
+                    if ($existing -ne $publicIp) {
+                        $lines[$i] = '{0}"{1}"{2}' -f $Matches[1], $publicIp, $Matches[3]
+                        $changed = $true
+                    }
+                }
+            }
+        }
+        elseif ($line -match 'ODBC_INFO') {
+            $newLine = $line
+            if ($newLine.Contains('SERVER=.\SQLEXPRESS')) {
+                $newLine = $newLine.Replace('SERVER=.\SQLEXPRESS', "SERVER=${sqlHost},${sqlPort}")
+            }
+            if ($odbcDriver -ne 'SQL Server' -and $newLine.Contains('{SQL Server}')) {
+                $newLine = $newLine.Replace('{SQL Server}', "{$odbcDriver}")
+            }
+            if ($saPassword -and $newLine -match '(PWD=)([^;"\s]+)') {
+                $existing = $Matches[2]
+                if ($existing -ne $saPassword) {
+                    # Literal replace on the matched substring -- avoids regex
+                    # injection from special chars in $saPassword.
+                    $matchedFull = $Matches[0]
+                    $newLine = $newLine.Replace($matchedFull, "PWD=$saPassword")
+                }
+            }
+            if ($newLine -ne $line) {
+                $lines[$i] = $newLine
+                $changed = $true
+            }
+        }
+    }
+
+    if ($changed) {
+        try {
+            [System.IO.File]::WriteAllText($file, ($lines -join $eol))
+            Write-Host "  rewrote: $file"
+        } catch {
+            Write-Warning "  $file is not writable: $_"
+            Write-Host   "         Mount its parent dir as a per-container writable overlay, e.g.:"
+            Write-Host   "           -v <host-dir>:$(Split-Path $file -Parent)"
+        }
+    }
+}
+
+Write-Host "Walking config includes from $processDir..."
+$includes = @(Get-IncludePaths -cfgDir $processDir)
+if ($includes.Count -gt 0) {
+    foreach ($inc in $includes) {
+        Rewrite-ConfigFile -file $inc
+    }
+} else {
+    Write-Host "  (no #include directives found in $processDir\*.txt)"
+}
+
+# --- Step 1: Registry keys required by Fiesta exes ---
+# Fantasy/GBO keys are baked into the exes' license/anti-tamper checks.
+Write-Host "Setting up registry keys..."
+reg add 'HKLM\SOFTWARE\Wow6432Node\Fantasy\Fighter' /v Bird   /d Eagle      /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\Fantasy\Fighter' /v Insect /d Honet      /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Desert   /d 138127     /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Mountain /d 30324      /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Natural  /d 126810443  /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Ocean    /d 7241589632 /f | Out-Null
+reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Sabana   /d 2554545953 /f | Out-Null
+
+# --- Step 2: Optionally start GamigoZR (anti-cheat) for Zone processes ---
+function Should-StartGamigoZR {
+    switch ($startGamigoZR) {
+        '1'    { return $true }
+        '0'    { return $false }
+        'auto' { return ($processExe -ieq 'Zone.exe') }
+        default {
+            Write-Warning "Unknown START_GAMIGOZR='$startGamigoZR', treating as auto"
+            return ($processExe -ieq 'Zone.exe')
+        }
+    }
+}
+
+if (Should-StartGamigoZR) {
+    $gamigoZRExe = Join-Path $fiestaPath (Join-Path $gamigoZRDir 'GamigoZR.exe')
+    if (Test-Path $gamigoZRExe) {
+        Write-Host "Registering GamigoZR service..."
+        sc.exe delete GamigoZR 2>$null | Out-Null
+        sc.exe create GamigoZR binPath= $gamigoZRExe start= demand | Out-Null
+        try {
+            Start-Service -Name GamigoZR -ErrorAction Stop
+            Write-Host "  GamigoZR started -> $gamigoZRExe"
+        }
+        catch {
+            Write-Warning "  GamigoZR failed to start: $_"
+        }
+    }
+    else {
+        Write-Warning "GamigoZR.exe not found at $gamigoZRExe"
+        Write-Host   "  Set START_GAMIGOZR=0 to skip, or GAMIGOZR_DIR=<your-dir> to override."
+    }
+}
+
+# --- Step 3: Clean stale logs that might trick the tailer ---
+$logDir = Join-Path $processDir 'DebugMessage'
+$logPatterns = @('Assert*.txt','ExitLog*.txt','Msg_*.txt','Dbg.txt',
+                 'MapLoad*.txt','Message*.txt','Size*.txt','*CallStack.txt','5ZoneServer*.txt')
+
+if (Test-Path $logDir) {
+    Get-ChildItem "$logDir\*.txt" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+foreach ($pat in $logPatterns) {
+    Get-ChildItem $processDir -Filter $pat -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+
+# --- Step 4: Register and start the Windows service ---
+# Running the exe directly would block on StartServiceCtrlDispatcher() -- register
+# with sc.exe and let SCM start it. cd to the process dir so any relative paths
+# the exe uses resolve correctly.
+Set-Location $processDir
+
+Write-Host "Registering service: $serviceName -> $exePath"
+sc.exe delete $serviceName 2>$null | Out-Null
+sc.exe create $serviceName binPath= $exePath start= demand | Out-Null
+
+$maxWait = 15
+$service = $null
+for ($i = 0; $i -lt $maxWait; $i++) {
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($service) { break }
+    Start-Sleep -Seconds 1
+}
+
+if (-not $service) {
+    Write-Error "Service '$serviceName' not registered after ${maxWait}s."
+    if ($keepAlive) {
+        Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
+        while ($true) { Start-Sleep -Seconds 60 }
+    }
+    exit 1
+}
+
+Write-Host "Starting service: $serviceName"
+try {
+    Start-Service -Name $serviceName -ErrorAction Stop
+    Write-Host "$serviceName started."
+}
+catch {
+    Write-Warning "Failed to start ${serviceName}: $_"
+}
+
+# --- Step 5: Wait for log files to appear, then tail them ---
+function Get-LogFiles {
+    param($processDir, $logDir)
+    $files = @()
+    if (Test-Path $logDir) {
+        $files += @(Get-ChildItem "$logDir\*.txt" -ErrorAction SilentlyContinue)
+    }
+    foreach ($pat in @('Assert*.txt','ExitLog*.txt','Msg_*.txt','Dbg.txt',
+                       'MapLoad*.txt','Message*.txt','Size*.txt','*CallStack.txt','5ZoneServer*.txt')) {
+        $files += @(Get-ChildItem $processDir -Filter $pat -ErrorAction SilentlyContinue)
+    }
+    return $files
+}
+
+Write-Host "Waiting for log files..."
+$timeout  = 60
+$logFiles = @()
+for ($i = 0; $i -lt $timeout; $i++) {
+    $logFiles = Get-LogFiles $processDir $logDir
+    if ($logFiles.Count -gt 0) { break }
+    Start-Sleep -Seconds 1
+}
+
+if ($logFiles.Count -eq 0) {
+    Write-Host "No log files after ${timeout}s -- process may have crashed during init."
+    if ($keepAlive) {
+        Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
+        while ($true) { Start-Sleep -Seconds 60 }
+    }
+    exit 1
+}
+
+Write-Host ("Tailing {0} log file(s): {1}" -f $logFiles.Count, ($logFiles.Name -join ', '))
+
+$jobs = @()
+foreach ($lf in $logFiles) {
+    $jobs += Start-Job -ScriptBlock {
+        param($path, $tag)
+        Get-Content -Path $path -Wait | ForEach-Object { '[{0}] {1}' -f $tag, $_ }
+    } -ArgumentList $lf.FullName, $lf.BaseName
+}
+
+$watcherJob = Start-Job -ScriptBlock {
+    param($processDir, $logDir)
+    $known = @{}
+    while ($true) {
+        $files = @()
+        if (Test-Path $logDir) { $files += @(Get-ChildItem "$logDir\*.txt" -ErrorAction SilentlyContinue) }
+        foreach ($pat in @('Assert*.txt','ExitLog*.txt','Msg_*.txt','Dbg.txt',
+                           'MapLoad*.txt','Message*.txt','Size*.txt','*CallStack.txt','5ZoneServer*.txt')) {
+            $files += @(Get-ChildItem $processDir -Filter $pat -ErrorAction SilentlyContinue)
+        }
+        foreach ($f in $files) {
+            if (-not $known.ContainsKey($f.FullName)) {
+                $known[$f.FullName] = $true
+                Write-Output ('NEW_LOG:{0}:{1}' -f $f.FullName, $f.BaseName)
+            }
+        }
+        Start-Sleep -Seconds 5
+    }
+} -ArgumentList $processDir, $logDir
+
+# --- Step 6: Monitor service + forward log output ---
+$svcSeenRunning      = $false
+$svcCheckTick        = 0
+$svcStartTime        = Get-Date
+$svcNeverRanTimeout  = 30
+
+while ($true) {
+    Receive-Job -Job $watcherJob -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_ -match '^NEW_LOG:(.+):(.+)$') {
+            Write-Host ("New log file: {0}" -f $Matches[2])
+            $jobs += Start-Job -ScriptBlock {
+                param($path, $tag)
+                Get-Content -Path $path -Wait | ForEach-Object { '[{0}] {1}' -f $tag, $_ }
+            } -ArgumentList $Matches[1], $Matches[2]
+        }
+    }
+
+    foreach ($job in $jobs) {
+        Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+    }
+
+    $svcCheckTick++
+    if ($svcCheckTick -ge 5) {
+        $svcCheckTick = 0
+        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { $svcSeenRunning = $true }
+
+        $elapsed = ((Get-Date) - $svcStartTime).TotalSeconds
+        $neverStarted = (-not $svcSeenRunning) -and ($elapsed -gt $svcNeverRanTimeout) -and ($svc -and $svc.Status -eq 'Stopped')
+
+        if ($svcSeenRunning -and $svc -and $svc.Status -ne 'Running') {
+            Write-Host ("=== $serviceName stopped (exit code: {0}) ===" -f $svc.ExitCode) -ForegroundColor Yellow
+        }
+        elseif ($neverStarted) {
+            Write-Host ("=== $serviceName never reached Running ({0:N0}s elapsed) ===" -f $elapsed) -ForegroundColor Red
+        }
+        else {
+            continue
+        }
+
+        for ($d = 0; $d -lt 10; $d++) {
+            Start-Sleep -Milliseconds 500
+            foreach ($job in $jobs) {
+                Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            }
+        }
+        if ($keepAlive) {
+            Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
+            while ($true) { Start-Sleep -Seconds 60 }
+        }
+        exit 1
+    }
+
+    Start-Sleep -Milliseconds 500
+}

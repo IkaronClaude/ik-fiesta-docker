@@ -1,0 +1,96 @@
+# Fiesta Online server runtime -- Linux/Wine variant
+#
+# Generic bring-your-own-binaries image. Contains NO copyrighted server files.
+# At runtime, mount your Fiesta server folder (the one with 9Data/, Zone01/,
+# Account/, GamigoZR/, ...) at /fiesta, and pass the exe as the trailing arg.
+#
+# Example:
+#   docker run --rm --network host \
+#     -v /path/to/fiesta-server:/fiesta \
+#     -v /path/to/per-container/serverinfo:/fiesta/9Data/ServerInfo \
+#     ghcr.io/<you>/fiesta-server-runtime:latest \
+#     Login/Login.exe
+#
+# See deploy/runtime/README.md for the full interface.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 32-bit architecture support (Fiesta server exes are 32-bit Windows binaries).
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        wine wine32 wine64 \
+        xvfb \
+        unixodbc unixodbc-dev \
+        tdsodbc tdsodbc:i386 libodbc2:i386 \
+        wget ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# FreeTDS as the {SQL Server} ODBC driver -- 32-bit path for the 32-bit exes.
+RUN printf '[SQL Server]\n\
+Description=FreeTDS ODBC driver for SQL Server\n\
+Driver=/usr/lib/i386-linux-gnu/odbc/libtdsodbc.so\n\
+Setup=/usr/lib/i386-linux-gnu/odbc/libtdsS.so\n\
+FileUsage=1\n' > /etc/odbcinst.ini
+
+# Wine Mono (.NET support -- required by GamigoZR).
+RUN wget -q https://dl.winehq.org/wine/wine-mono/9.0.0/wine-mono-9.0.0-x86.msi \
+        -O /tmp/wine-mono.msi
+
+# Initialise a 64-bit Wine prefix with WoW64 (so 32-bit exes load), install Mono,
+# and force builtin odbc32.dll so Wine bridges to system unixODBC/FreeTDS.
+ENV WINEPREFIX=/root/.wine
+RUN Xvfb :99 -screen 0 800x600x24 -nolisten tcp & \
+    export DISPLAY=:99 && \
+    sleep 1 && \
+    WINEDEBUG=-all wine wineboot --init 2>/dev/null; \
+    WINEDEBUG=-all wine msiexec /i /tmp/wine-mono.msi 2>/dev/null; \
+    rm -f /tmp/wine-mono.msi; \
+    WINEDEBUG=-all wine reg add 'HKCU\Software\Wine\DllOverrides' \
+        /v odbc32 /t REG_SZ /d builtin /f 2>/dev/null; \
+    pkill Xvfb 2>/dev/null; true
+
+COPY start.sh /usr/local/bin/start.sh
+RUN chmod +x /usr/local/bin/start.sh
+
+# --- Runtime interface (override at `docker run`) ---
+# FIESTA_PATH     Mount point for the user's server folder. Default: /fiesta.
+# FIESTA_EXE      Relative path under FIESTA_PATH to the exe to launch, e.g.
+#                 "Zone01/Zone.exe" or "Login/Login.exe". REQUIRED.
+#                 Can be passed as an env var OR as the trailing CMD arg
+#                 (`docker run ... fiesta-server-runtime Login/Login.exe`).
+# PUBLIC_IP       Optional. If set, the IP field in every SERVER_INFO row whose
+#                 trailing comment marker is "PUBLIC_IP" (the client-facing rows)
+#                 is rewritten to this value. LOCALHOST-tagged rows are left as
+#                 127.0.0.1. Labels and ports are never touched.
+# SQL_HOST        SQL Server hostname for ODBC rewrites. Default: 127.0.0.1
+#                 (works with host networking + SQL on the same host).
+# SQL_PORT        SQL Server port. Default: 1433.
+# SA_PASSWORD     Optional. If set, replaces PWD= values in ODBC_INFO rows.
+# ODBC_DRIVER     ODBC driver name inserted into DRIVER={...}. Default on Linux:
+#                 "SQL Server" (FreeTDS, set up in /etc/odbcinst.ini).
+# START_GAMIGOZR  "auto" (start GamigoZR if the target exe is Zone.exe -- default),
+#                 "1" (always start), "0" (never start).
+# GAMIGOZR_DIR    Subdir under FIESTA_PATH containing GamigoZR.exe. Default: GamigoZR.
+# SERVICE_NAME    Optional override for the Wine SCM service name (default: _<dirname>).
+# KEEP_ALIVE      "1" -> keep container alive after the game process exits (for
+#                 `docker exec` debugging). Default: "0" (container exits with process).
+ENV FIESTA_PATH=/fiesta \
+    FIESTA_EXE="" \
+    PUBLIC_IP="" \
+    SQL_HOST=127.0.0.1 \
+    SQL_PORT=1433 \
+    SA_PASSWORD="" \
+    ODBC_DRIVER="SQL Server" \
+    START_GAMIGOZR=auto \
+    GAMIGOZR_DIR=GamigoZR \
+    SERVICE_NAME="" \
+    KEEP_ALIVE=0
+
+LABEL org.opencontainers.image.title="fiesta-server-runtime" \
+      org.opencontainers.image.description="Bring-your-own runtime for Fiesta Online server binaries (Wine on Linux)" \
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+
+ENTRYPOINT ["/usr/local/bin/start.sh"]
