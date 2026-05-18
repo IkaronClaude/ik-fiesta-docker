@@ -62,21 +62,27 @@ services:
         done
 
   sqlserver:
-    image: mcr.microsoft.com/mssql/server:2022-latest
+    image: fiesta-sql-runtime:latest
     restart: on-failure
     network_mode: host
     environment:
+      SA_PASSWORD: "${SA_PASSWORD:?SA_PASSWORD not set}"
       MSSQL_SA_PASSWORD: "${SA_PASSWORD:?SA_PASSWORD not set}"
-      ACCEPT_EULA: "Y"
     volumes:
+      # Named volume -- survives container destruction, recreate, image
+      # rebuild, `docker compose down` (no -v), and `docker compose rm`.
+      # The ONLY commands that delete it are:
+      #   docker compose down -v     # nukes named volumes too
+      #   docker volume rm fiesta-docker-example_sql-data
+      # See README.md "What happens on `docker compose down`?" for details.
       - sql-data:/var/opt/mssql
-      - ${FIESTA_SERVER:?}/Databases:/var/opt/mssql/backup
+      - ${FIESTA_SERVER:?}/Databases:/var/opt/mssql/backup:ro
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"]
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$SA_PASSWORD\" -C -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$SA_PASSWORD\" -C -Q 'SELECT 1'"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
 
   # --- Shared anti-cheat (HTTP service all zones connect to) ---
   gamigozr:
@@ -263,4 +269,8 @@ services:
         condition: service_started
 
 volumes:
+  # DB data lives in a Docker-managed named volume. It survives container
+  # destruction, recreation, image rebuilds, and plain `docker compose down`.
+  # See README.md "What happens on `docker compose down`?" for the full
+  # matrix of what does and does not delete this data.
   sql-data:

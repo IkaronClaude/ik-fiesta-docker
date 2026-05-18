@@ -179,6 +179,34 @@ function Rewrite-ConfigFile {
     }
 }
 
+# Auto-detect PUBLIC_IP if unset. Fiesta servers bind() the IP they advertise
+# in ServerInfo.txt, so whatever we write there has to exist on a local
+# interface inside this container -- otherwise bind fails with WSAEADDRNOTAVAIL
+# and the service never comes up. The source address for default-route traffic
+# is the host LAN IP (the one external clients use to reach us). Detect that
+# and use it as the default PUBLIC_IP so operators don't have to guess.
+if (-not $publicIp) {
+    $detected = $null
+    try {
+        $route = Find-NetRoute -RemoteIPAddress 1.1.1.1 -ErrorAction Stop | Select-Object -First 1
+        if ($route -and $route.IPAddress) { $detected = $route.IPAddress }
+    } catch { }
+    if (-not $detected) {
+        try {
+            $detected = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                Sort-Object -Property InterfaceMetric |
+                Select-Object -First 1).IPAddress
+        } catch { }
+    }
+    if ($detected) {
+        $publicIp = $detected
+        Write-Host "  PUBLIC_IP auto-detected: $publicIp"
+    } else {
+        Write-Host "  PUBLIC_IP not set and auto-detect failed -- SERVER_INFO rows unchanged."
+    }
+}
+
 Write-Host "Walking config includes from $processDir..."
 $includes = @(Get-IncludePaths -cfgDir $processDir)
 if ($includes.Count -gt 0) {

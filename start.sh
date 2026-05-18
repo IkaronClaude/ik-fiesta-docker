@@ -43,11 +43,13 @@ FIESTA_EXE="${FIESTA_EXE//\\//}"
 
 PROCESS_REL_DIR="$(dirname "${FIESTA_EXE}")"
 PROCESS_EXE="$(basename "${FIESTA_EXE}")"
-PROCESS_DIR="${FIESTA_PATH}/${PROCESS_REL_DIR}"
-EXE_PATH="${PROCESS_DIR}/${PROCESS_EXE}"
+SOURCE_DIR="${FIESTA_PATH}/${PROCESS_REL_DIR}"
+SOURCE_EXE="${SOURCE_DIR}/${PROCESS_EXE}"
 DIRNAME="$(basename "${PROCESS_REL_DIR}")"
 
-: "${SERVICE_NAME:=_${DIRNAME}}"
+# SERVICE_NAME is set after SOURCE_DIR is validated below, so we can read
+# the exe's expected name out of its per-process *ServerInfo.txt. See the
+# `Discover SERVICE_NAME` block after the validation.
 
 if [ ! -d "${FIESTA_PATH}" ]; then
     echo "ERROR: FIESTA_PATH (${FIESTA_PATH}) is not a directory."
@@ -55,8 +57,8 @@ if [ ! -d "${FIESTA_PATH}" ]; then
     exit 1
 fi
 
-if [ ! -f "${EXE_PATH}" ]; then
-    echo "ERROR: exe not found: ${EXE_PATH}"
+if [ ! -f "${SOURCE_EXE}" ]; then
+    echo "ERROR: exe not found: ${SOURCE_EXE}"
     echo "  FIESTA_PATH = ${FIESTA_PATH}"
     echo "  FIESTA_EXE  = ${FIESTA_EXE}"
     echo "  Directory listing:"
@@ -64,9 +66,68 @@ if [ ! -f "${EXE_PATH}" ]; then
     exit 1
 fi
 
+# --- Discover SERVICE_NAME ---
+# Every Fiesta exe embeds its expected SCM service name in a per-process
+# *ServerInfo.txt with a line like:
+#     MY_SERVER "_Zone1",   "_Zone1",  6, 0, 1
+# The first quoted string is the service name the exe will look up in
+# HKLM\System\CurrentControlSet\Services to decide whether it's running
+# under SCM. If sc.exe registered it under any other name (e.g. _Zone01
+# instead of _Zone1) the exe falls into a "service upload only" path:
+# self-registers the expected name in the wine registry, exits, and only
+# the next container start finds the registration and proceeds as a game
+# server. Reading the embedded name and matching it skips that cycle.
+#
+# Layout varies: Zones nest it under ZoneServerInfo/ZoneServerInfo.txt,
+# Login/WorldManager/Account-family put it next to the exe. -maxdepth 3
+# covers both without descending into log trees. Operator-supplied
+# SERVICE_NAME (env) always wins; _<dirname> is the fallback for exes
+# that don't ship a MY_SERVER line (e.g. GamigoZR).
+if [ -z "${SERVICE_NAME:-}" ]; then
+    # `|| true` at the end is load-bearing: when no *.txt has a MY_SERVER
+    # line (e.g. GamigoZR -- it's a .NET HTTP service, not a Fiesta game-
+    # server exe), grep exits 1, `find -exec ... +` propagates that, and
+    # under `set -eo pipefail` the parent shell aborts before printing a
+    # single line. The `|| true` swallows the empty-match case so we fall
+    # through to the `_<dirname>` default.
+    DISCOVERED_NAME=$(find "${SOURCE_DIR}" -maxdepth 3 -type f -name '*.txt' \
+        -exec grep -hE '^[[:space:]]*MY_SERVER[[:space:]]+"' {} + 2>/dev/null \
+        | head -1 \
+        | sed -nE 's/^[[:space:]]*MY_SERVER[[:space:]]+"([^"]+)".*/\1/p') || true
+    if [ -n "${DISCOVERED_NAME}" ]; then
+        SERVICE_NAME="${DISCOVERED_NAME}"
+        echo "  SERVICE_NAME discovered from MY_SERVER: ${SERVICE_NAME}"
+    else
+        SERVICE_NAME="_${DIRNAME}"
+        echo "  SERVICE_NAME fallback (no MY_SERVER in *.txt): ${SERVICE_NAME}"
+    fi
+fi
+
+# Wine can't mmap a PE file with PROT_EXEC over a Windows-host bind mount
+# (Docker Desktop on Windows uses 9P/Plan-9 to back the mount, which doesn't
+# honour exec). Symptom: every server exe page-faults at the first instruction.
+# Workaround: copy the per-process directory into a container-local writable
+# location (/server/...) and run from there. The included 9Data/ServerInfo
+# overlay stays on the bind mount so per-container config rewrites still land
+# where the operator can see them.
+PROCESS_DIR="/server/${PROCESS_REL_DIR}"
+EXE_PATH="${PROCESS_DIR}/${PROCESS_EXE}"
+mkdir -p "$(dirname "${PROCESS_DIR}")"
+echo "Copying ${SOURCE_DIR}/ -> ${PROCESS_DIR}/ (bind-mount exec workaround)..."
+rm -rf "${PROCESS_DIR}"
+cp -a "${SOURCE_DIR}" "${PROCESS_DIR}"
+
+# The exe resolves 9Data via relative paths like "../../9Data/...". With the
+# process dir now under /server, link /server/9Data back to the bind mount so
+# those paths still hit the operator's data (and the per-container ServerInfo
+# overlay).
+if [ -d "${FIESTA_PATH}/9Data" ] && [ ! -e /server/9Data ]; then
+    ln -s "${FIESTA_PATH}/9Data" /server/9Data
+fi
+
 echo "=== Fiesta runtime (Linux/Wine) ==="
 echo "  Server folder : ${FIESTA_PATH}"
-echo "  Process dir   : ${PROCESS_DIR}"
+echo "  Process dir   : ${PROCESS_DIR}  (local copy of ${SOURCE_DIR})"
 echo "  Exe           : ${PROCESS_EXE}"
 echo "  Service name  : ${SERVICE_NAME}"
 
@@ -89,14 +150,20 @@ echo "  Service name  : ${SERVICE_NAME}"
 # 9Data/ServerInfo/ as a per-container directory so the rewrite doesn't race
 # with other containers reading/writing the same file -- see README.
 
-# Collect set of absolute paths #include'd by *.txt files in a directory.
+# Collect set of absolute paths #include'd by *.txt files under cfg_dir.
+# Recurses 3 levels deep: Zone processes keep their entry-point config in
+# ZoneServerInfo/ZoneServerInfo.txt (one subdir down), which is what chains
+# the include to 9Data/ServerInfo/ServerInfo.txt. maxdepth=3 covers that
+# and any sibling cases without walking arbitrarily-deep log trees.
 collect_includes() {
     local cfg_dir="$1"
     local f rel d
     {
         while IFS= read -r -d '' f; do
             d="$(dirname "$f")"
-            grep -hE '^[[:space:]]*#include[[:space:]]+"[^"]+"' "$f" 2>/dev/null \
+            # grep exits 1 when a file has no #include lines; pipefail would
+            # then abort the script, so swallow it with `|| true`.
+            { grep -hE '^[[:space:]]*#include[[:space:]]+"[^"]+"' "$f" 2>/dev/null || true; } \
                 | sed -E 's/^[[:space:]]*#include[[:space:]]+"([^"]+)".*/\1/' \
                 | while IFS= read -r rel; do
                     rel="${rel//\\//}"
@@ -105,7 +172,7 @@ collect_includes() {
                         *)  ( cd "${d}" 2>/dev/null && readlink -f "${rel}" 2>/dev/null ) ;;
                     esac
                 done
-        done < <(find "${cfg_dir}" -maxdepth 1 -type f -name '*.txt' -print0)
+        done < <(find "${cfg_dir}" -maxdepth 3 -type f -name '*.txt' -print0)
     } | sort -u
 }
 
@@ -171,6 +238,46 @@ rewrite_config_file() {
     fi
 }
 
+# Auto-detect PUBLIC_IP if unset. Fiesta servers bind() the IP they advertise
+# in ServerInfo.txt, so whatever we write there has to be an IP that actually
+# exists on a local interface inside this container -- otherwise bind fails
+# with EADDRNOTAVAIL and the service never comes up. On a native Linux Docker
+# host (or k8s), the default-route source IP is the host LAN IP, which is
+# both bindable and what off-host clients use to reach us. Perfect.
+#
+# Docker Desktop on Mac/Windows is the awkward case: even with the "Host
+# networking" toggle on, the container sees only Docker Desktop's internal
+# Linux VM (eth0 = 192.168.65.0/24), NOT the Windows/Mac NIC. The only IP
+# both bindable here and reachable from the host is 127.0.0.1 -- the toggle
+# forwards localhost binds back to the host. Off-host LAN clients CAN'T
+# reach the server in that setup; for a publicly-accessible deployment use
+# a native Linux Docker / k8s host.
+if [ -z "${PUBLIC_IP:-}" ]; then
+    DETECTED_IP=""
+    if command -v ip >/dev/null 2>&1; then
+        DETECTED_IP=$(ip route get 1.1.1.1 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+    if [ -z "${DETECTED_IP}" ] && command -v hostname >/dev/null 2>&1; then
+        DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    if [[ "${DETECTED_IP}" == 192.168.65.* ]]; then
+        echo "  PUBLIC_IP auto-detect: container is on Docker Desktop's internal VM"
+        echo "    subnet (${DETECTED_IP}). Off-host clients can't reach that IP; using"
+        echo "    127.0.0.1 instead, which Docker Desktop's host-networking toggle"
+        echo "    forwards back to the Mac/Windows host. For LAN-accessible servers,"
+        echo "    deploy on native Linux Docker / k8s."
+        DETECTED_IP="127.0.0.1"
+    fi
+    if [ -n "${DETECTED_IP}" ]; then
+        PUBLIC_IP="${DETECTED_IP}"
+        export PUBLIC_IP
+        echo "  PUBLIC_IP auto-detected: ${PUBLIC_IP}"
+    else
+        echo "  PUBLIC_IP not set and auto-detect failed -- SERVER_INFO rows unchanged."
+    fi
+fi
+
 echo "Walking config includes from ${PROCESS_DIR}..."
 INCLUDES="$(collect_includes "${PROCESS_DIR}")"
 if [ -n "${INCLUDES}" ]; then
@@ -198,21 +305,32 @@ sleep 1
 # Kill any stale wineserver left over from a previous container start.
 wineserver -k 2>/dev/null || true
 
+# Honor caller-supplied WINEDEBUG (e.g. WINEDEBUG=+thread,+process for
+# diagnostics), otherwise silence Wine. Exporting it once means wineserver
+# and services.exe (spawned by the first `wine` call below) inherit it, and
+# Zone.exe / Login.exe launched later via SCM inherit it too -- there's no
+# other reliable way to attach debug channels to a service-hosted exe.
+# Note: Wine 9.0 ignores WINEDEBUGLOG, and services.exe rewires service
+# stdio to /dev/null, so WINEDEBUG output from service-hosted exes is
+# effectively lost. Useful only for the initial `wine` / `wineserver`
+# warmup calls above.
+export WINEDEBUG="${WINEDEBUG:--all}"
+
 # --- Step 2: Registry keys required by Fiesta exes ---
 # Fantasy/GBO keys are baked into the exes' license/anti-tamper checks.
 echo "Setting up registry keys..."
-WINEDEBUG=-all wine reg add 'HKCU\Software\Wine\DllOverrides' /v odbc32 /t REG_SZ /d builtin /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\Fantasy' /ve /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\Fantasy\Fighter' /v Bird   /d Eagle      /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\Fantasy\Fighter' /v Insect /d Honet      /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Desert   /d 138127     /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Mountain /d 30324      /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Natural  /d 126810443  /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Ocean    /d 7241589632 /f 2>/dev/null
-WINEDEBUG=-all wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Sabana   /d 2554545953 /f 2>/dev/null
+wine reg add 'HKCU\Software\Wine\DllOverrides' /v odbc32 /t REG_SZ /d builtin /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\Fantasy' /ve /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\Fantasy\Fighter' /v Bird   /d Eagle      /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\Fantasy\Fighter' /v Insect /d Honet      /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Desert   /d 138127     /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Mountain /d 30324      /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Natural  /d 126810443  /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Ocean    /d 7241589632 /f 2>/dev/null
+wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Sabana   /d 2554545953 /f 2>/dev/null
 
-# Warm up Wine's SCM -- first invocation is slow and can race with sc.exe create.
-WINEDEBUG=-all wine sc.exe query type= service state= all 2>/dev/null || true
+# Warm up Wine's SCM -- first invocation spawns services.exe and is slow.
+wine sc.exe query type= service state= all 2>/dev/null || true
 
 # --- Step 3: Optionally start GamigoZR (anti-cheat) for Zone processes ---
 should_start_gamigozr() {
@@ -226,16 +344,23 @@ should_start_gamigozr() {
 }
 
 if should_start_gamigozr; then
-    GAMIGOZR_EXE="${FIESTA_PATH}/${GAMIGOZR_DIR}/GamigoZR.exe"
-    if [ -f "${GAMIGOZR_EXE}" ]; then
+    GAMIGOZR_SRC="${FIESTA_PATH}/${GAMIGOZR_DIR}/GamigoZR.exe"
+    if [ -f "${GAMIGOZR_SRC}" ]; then
+        # Same bind-mount-exec workaround: copy GamigoZR into /server/ before launch.
+        GAMIGOZR_LOCAL_DIR="/server/${GAMIGOZR_DIR}"
+        if [ ! -f "${GAMIGOZR_LOCAL_DIR}/GamigoZR.exe" ]; then
+            mkdir -p "$(dirname "${GAMIGOZR_LOCAL_DIR}")"
+            cp -a "${FIESTA_PATH}/${GAMIGOZR_DIR}" "${GAMIGOZR_LOCAL_DIR}"
+        fi
+        GAMIGOZR_EXE="${GAMIGOZR_LOCAL_DIR}/GamigoZR.exe"
         WIN_GAMIGOZR="Z:${GAMIGOZR_EXE//\//\\}"
         echo "Registering GamigoZR service..."
-        WINEDEBUG=-all wine sc.exe delete GamigoZR 2>/dev/null || true
-        WINEDEBUG=-all wine sc.exe create GamigoZR binPath= "${WIN_GAMIGOZR}" start= demand 2>/dev/null || true
-        WINEDEBUG=-all wine sc.exe start  GamigoZR 2>/dev/null || true
+        wine sc.exe delete GamigoZR 2>/dev/null || true
+        wine sc.exe create GamigoZR binPath= "${WIN_GAMIGOZR}" start= demand 2>/dev/null || true
+        wine sc.exe start  GamigoZR 2>/dev/null || true
         echo "  GamigoZR -> ${WIN_GAMIGOZR}"
     else
-        echo "WARN: GamigoZR.exe not found at ${GAMIGOZR_EXE}"
+        echo "WARN: GamigoZR.exe not found at ${GAMIGOZR_SRC}"
         echo "  Set START_GAMIGOZR=0 to skip, or GAMIGOZR_DIR=<your-dir> to override."
     fi
 fi
@@ -247,22 +372,47 @@ fi
 cd "${PROCESS_DIR}"
 STDOUT_LOG="${PROCESS_DIR}/stdout.txt"
 WIN_STDOUT="Z:${STDOUT_LOG//\//\\}"
+# Unquoted form -- matches Mimir's working setup. Quoting the cmd /c
+# argument was tried in earlier debug sessions and didn't help; sticking
+# to the known-good form.
 BIN_PATH="cmd /c ${WIN_EXE} > ${WIN_STDOUT} 2>&1"
 
 echo "Registering service: ${SERVICE_NAME} -> ${WIN_EXE}"
-WINEDEBUG=-all wine sc.exe delete "${SERVICE_NAME}" 2>/dev/null || true
-WINEDEBUG=-all wine sc.exe create "${SERVICE_NAME}" \
+wine sc.exe delete "${SERVICE_NAME}" 2>/dev/null || true
+wine sc.exe create "${SERVICE_NAME}" \
     binPath= "${BIN_PATH}" start= demand 2>/dev/null || true
 
 echo "Starting service: ${SERVICE_NAME}"
-WINEDEBUG=-all wine sc.exe start "${SERVICE_NAME}" 2>/dev/null || true
+wine sc.exe start "${SERVICE_NAME}" 2>/dev/null || true
 
-# Wine's SCM lies about service state -- poll for the actual process instead.
+# Wine's SCM lies about service state -- poll for the actual cmd-wrapped
+# process instead. Match against the full Wine path (Z:\server\...) so we
+# don't false-positive on start.sh's own argv (which contains the exe name).
+# pgrep -f uses ERE, so the literal backslashes need to be doubled.
+PROC_MATCH="${WIN_EXE//\\/\\\\}"
+
+# Find non-zombie PIDs whose cmdline matches PROC_MATCH. Zombies (state Z)
+# linger after Wine kills a service process and would otherwise keep the
+# container "alive" forever; strip them. Returns the live PIDs on stdout,
+# exit 0 if any live, exit 1 if none.
+live_service_pids() {
+    local pid state out=""
+    for pid in $(pgrep -f -- "${PROC_MATCH}" 2>/dev/null); do
+        # /proc/<pid>/stat field 3 is the single-letter state.
+        state=$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null)
+        [ "${state}" = "Z" ] && continue   # zombie -- treat as dead
+        [ -z "${state}" ] && continue      # disappeared between pgrep and stat
+        out="${out} ${pid}"
+    done
+    [ -n "${out}" ] && echo "${out# }" && return 0
+    return 1
+}
+
 echo "Waiting for ${PROCESS_EXE} to appear..."
 STARTED=0
 for i in $(seq 1 30); do
-    if pgrep -f "${PROCESS_EXE}" > /dev/null 2>&1; then
-        echo "${PROCESS_EXE} is running (PID: $(pgrep -f "${PROCESS_EXE}" | head -1))."
+    if PIDS=$(live_service_pids); then
+        echo "${PROCESS_EXE} is running (PID: ${PIDS%% *})."
         STARTED=1
         break
     fi
@@ -286,7 +436,7 @@ echo "Tailing logs in ${PROCESS_DIR} and ${LOG_DIR}..."
 
 (
     declare -A SEEN
-    while pgrep -f "${PROCESS_EXE}" > /dev/null 2>&1; do
+    while live_service_pids > /dev/null; do
         for f in \
             "${STDOUT_LOG}" \
             "${PROCESS_DIR}"/Assert*.txt \
@@ -313,7 +463,11 @@ echo "Tailing logs in ${PROCESS_DIR} and ${LOG_DIR}..."
 TAIL_PID=$!
 
 # --- Step 6: Wait for the process to die ---
-while pgrep -f "${PROCESS_EXE}" > /dev/null 2>&1; do
+# Use live_service_pids (matches the full Wine path Z:\server\...\X.exe and
+# strips zombies), NOT a loose pgrep -f "${PROCESS_EXE}" -- the latter would
+# also match start.sh's own argv (the exe name is $1) and never return false,
+# leaving the container running forever after the service has already died.
+while live_service_pids > /dev/null; do
     sleep 5
 done
 

@@ -1,0 +1,84 @@
+# Fiesta SQL Server runtime -- Windows variant
+#
+# Generic bring-your-own-data image. Contains NO database backups or game data.
+# At runtime, mount your Databases folder (with the *.bak files) at C:\backups.
+# The entrypoint walks every *.bak in that dir and RESTOREs it on first boot
+# (skipped if the DB is already on the persistent volume).
+#
+# Build (Docker Desktop must be in Windows-container mode):
+#   set DOCKER_BUILDKIT=0
+#   docker build -f Dockerfile.sql.windows -t fiesta-sql-runtime:windows .
+#
+# Run:
+#   docker run --rm `
+#     -e SA_PASSWORD=YourStrongPassword1 `
+#     -v sql-data:C:\sql-data `
+#     -v C:\path\to\Server\Databases:C:\backups `
+#     -p 1433:1433 `
+#     ghcr.io/<you>/fiesta-sql-runtime:windows
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
+
+# Install SQL Server Express 2025 silently. The install-time SA password is
+# baked in here so the entrypoint always has *something* to log in with on
+# the first boot; the entrypoint will ALTER LOGIN it to the user's
+# SA_PASSWORD if they differ.
+RUN Invoke-WebRequest -Uri 'https://download.microsoft.com/download/7ab8f535-7eb8-4b16-82eb-eca0fa2d38f3/SQL2025-SSEI-Expr.exe' \
+      -OutFile C:/sql-express-setup.exe ; \
+    Start-Process -FilePath C:/sql-express-setup.exe \
+      -ArgumentList '/ACTION=Download', '/MEDIAPATH=C:/sql-media', '/MEDIATYPE=Core', '/QUIET' \
+      -Wait ; \
+    Start-Process -FilePath C:/sql-media/SQLEXPR_x64_ENU.exe \
+      -ArgumentList '/Q', '/ACTION=Install', '/FEATURES=SQLEngine', \
+        '/INSTANCENAME=SQLEXPRESS', '/SQLSYSADMINACCOUNTS="BUILTIN\Administrators"', \
+        '/SECURITYMODE=SQL', '/SAPWD=BootstrapPwd!1', \
+        '/TCPENABLED=1', '/IACCEPTSQLSERVERLICENSETERMS' \
+      -Wait ; \
+    Remove-Item -Recurse -Force C:/sql-express-setup.exe, C:/sql-media
+
+# Pin SQL Express to port 1433. Express defaults to dynamic port, which
+# requires SQL Browser. The registry path's version segment (MSSQL16,
+# MSSQL17, ...) varies per SQL release -- discover it.
+RUN $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server'; \
+    $instance = (Get-ChildItem $base | Where-Object { $_.PSChildName -match 'MSSQL\d+\.SQLEXPRESS' }).PSChildName; \
+    if (-not $instance) { throw 'Could not find SQLEXPRESS registry key' }; \
+    $regPath = ('{0}\{1}\MSSQLServer\SuperSocketNetLib\Tcp\IPAll' -f $base, $instance); \
+    Write-Host ('Setting TCP port 1433 at: ' + $regPath); \
+    Set-ItemProperty -Path $regPath -Name TcpPort -Value '1433'; \
+    Set-ItemProperty -Path $regPath -Name TcpDynamicPorts -Value ''
+
+# sqlcmd for the entrypoint's RESTORE work + the healthcheck.
+RUN Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2230791' \
+      -OutFile C:/sqlcmd.msi ; \
+    Start-Process msiexec.exe -ArgumentList '/i', 'C:/sqlcmd.msi', '/quiet', '/norestart' -Wait ; \
+    Remove-Item C:/sqlcmd.msi
+
+RUN $sqlcmdPath = 'C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn'; \
+    [Environment]::SetEnvironmentVariable('PATH', $env:PATH + ';' + $sqlcmdPath, 'Machine')
+
+# Backup mount target. Backups themselves are NOT baked in -- mount at runtime.
+RUN New-Item -ItemType Directory -Path C:\backups -Force | Out-Null ; \
+    New-Item -ItemType Directory -Path C:\sql-data -Force | Out-Null
+
+COPY setup-sql.ps1 C:/setup-sql.ps1
+
+EXPOSE 1433
+
+# --- Runtime interface ---
+# SA_PASSWORD     REQUIRED. sa user password. ALTER LOGIN'd from the install
+#                 password on first boot if different.
+# RESTORE_DBS     "auto" (default) = restore any *.bak whose DB isn't present.
+#                 "0" = skip restore entirely.
+# Volumes:
+#   C:\sql-data           -- persistent DB data (named volume).
+#   C:\backups            -- your Databases\ dir, read-only is fine.
+ENV SA_PASSWORD="" \
+    RESTORE_DBS=auto
+
+LABEL org.opencontainers.image.title="fiesta-sql-runtime" \
+      org.opencontainers.image.description="Bring-your-own SQL Server image with auto-restore of .bak files (Windows)" \
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+
+ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/setup-sql.ps1"]

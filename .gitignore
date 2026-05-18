@@ -1,3 +1,11 @@
+# Local planning / notes
+PLAN.md
+CLAUDE.md
+HANDOVER.md
+
+# Claude Code session state
+.claude/
+
 # Example stack runtime state
 example/serverinfo/
 example/.env

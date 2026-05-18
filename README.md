@@ -27,6 +27,12 @@ see [`example/`](example/).
 | Required registry | `Fantasy\*` + `GBO\*` set at startup | same                                  |
 | Entrypoint        | `/usr/local/bin/start.sh`         | `C:\start.ps1`                           |
 
+There is also a companion image, **`fiesta-sql-runtime`**, that bundles SQL
+Server (Linux) / SQL Express (Windows) with an auto-restore entrypoint --
+mount your `Databases/` folder and the `.bak` files restore on first boot.
+Built from `Dockerfile.sql.linux` / `Dockerfile.sql.windows`. Same BYO
+promise: the image ships no copyrighted DB files. See `PLAN.md` for design.
+
 What's **not** in the image: any of `9Data/`, `Login/`, `Zone*/`, `Account/`,
 `GamigoZR/`, `ServerInfo.txt`, or any other Fiesta-derived files. You bring
 those yourself at run time.
@@ -224,6 +230,12 @@ the linux or windows variant automatically based on the host's OS.
 - **`network_mode: host`** is the easy path on Linux: every service binds
   the ports it needs on the host and inter-process traffic stays on
   `127.0.0.1`. The default config works as-is.
+- **Docker Desktop for Windows** has a non-standard implementation of
+  `network_mode: host` -- containers share Docker's internal Linux VM, not
+  the Windows NIC, so LAN-remote clients can't reach `PUBLIC_IP`. See the
+  "Running on Docker Desktop for Windows" section in `example/README.md`
+  for workarounds (WSL2 mirrored mode + Docker Desktop's host networking
+  toggle, or just run the stack on real Linux).
 - **Mount must be read-write** wherever the exe writes (the process subdir
   for logs and `DebugMessage/`, and `9Data/` for `SubAbStateClass.txt`).
 - **Windows bind mounts are directory-only.** When isolating a single file,

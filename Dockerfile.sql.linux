@@ -1,0 +1,50 @@
+# Fiesta SQL Server runtime -- Linux variant
+#
+# Generic bring-your-own-data image. Contains NO database backups or game data.
+# At runtime, mount your Databases/ folder (with the *.bak files) at
+# /var/opt/mssql/backup. The entrypoint walks every *.bak in that dir and
+# RESTOREs it on first boot (skipped if the DB is already on the persistent
+# volume).
+#
+# Example:
+#   docker run --rm \
+#     -e SA_PASSWORD=YourStrongPassword1 \
+#     -e ACCEPT_EULA=Y \
+#     -v sql-data:/var/opt/mssql \
+#     -v /path/to/Server/Databases:/var/opt/mssql/backup:ro \
+#     -p 1433:1433 \
+#     ghcr.io/<you>/fiesta-sql-runtime:linux
+
+FROM mcr.microsoft.com/mssql/server:2022-latest
+
+USER root
+
+# Backup dir is created here so the bind-mount target always exists. Backups
+# themselves are NOT copied into the image -- they're mounted at runtime.
+RUN mkdir -p /var/opt/mssql/backup
+
+COPY setup-sql.sh /usr/local/bin/setup-sql.sh
+RUN chmod +x /usr/local/bin/setup-sql.sh
+
+EXPOSE 1433
+
+# --- Runtime interface ---
+# SA_PASSWORD     REQUIRED. sa user password. Enforced by the mssql base image.
+# ACCEPT_EULA     "Y" required. Set in the image; override only if you must.
+# RESTORE_DBS     "auto" (default) = restore any *.bak whose DB isn't present.
+#                 "0" = skip restore entirely (BYO live data on the volume).
+# Volumes:
+#   /var/opt/mssql            -- persistent DB data (named volume).
+#   /var/opt/mssql/backup     -- your Databases/ dir, read-only is fine.
+ENV ACCEPT_EULA=Y \
+    RESTORE_DBS=auto \
+    MSSQL_PID=Developer
+
+LABEL org.opencontainers.image.title="fiesta-sql-runtime" \
+      org.opencontainers.image.description="Bring-your-own SQL Server image with auto-restore of .bak files (Linux)" \
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+
+# Override the base image's ENTRYPOINT -- our setup script owns the sqlservr
+# lifecycle (start in background, restore, then wait).
+ENTRYPOINT []
+CMD ["/bin/bash", "/usr/local/bin/setup-sql.sh"]

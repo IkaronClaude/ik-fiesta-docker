@@ -25,7 +25,7 @@ RUN dpkg --add-architecture i386 \
         xvfb \
         unixodbc unixodbc-dev \
         tdsodbc tdsodbc:i386 libodbc2:i386 \
-        wget ca-certificates procps \
+        wget ca-certificates procps iproute2 strace \
     && rm -rf /var/lib/apt/lists/*
 
 # FreeTDS as the {SQL Server} ODBC driver -- 32-bit path for the 32-bit exes.
