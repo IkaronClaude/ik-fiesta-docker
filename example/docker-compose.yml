@@ -84,9 +84,14 @@ services:
       retries: 10
       start_period: 60s
 
-  # --- Shared anti-cheat (HTTP service all zones connect to) ---
+  # --- Shared anti-cheat / zone-response HTTP service ---
+  # Two flavours; pick one. Default is the real .NET GamigoZR.exe under
+  # the runtime image (Wine on Linux, native on Windows). The lighter
+  # alternative is `fiesta-gamigozr-stub`, an nginx serving a single
+  # pre-extracted crypt blob -- see the `gamigozr-stub` block below.
   gamigozr:
     <<: *fiesta
+    profiles: ["", "real-gamigozr"]   # default profile
     command: ["GamigoZR/GamigoZR.exe"]
     environment:
       <<: *fiesta-env
@@ -97,6 +102,22 @@ services:
     depends_on:
       init:
         condition: service_completed_successfully
+
+  # Opt in with: `docker compose --profile gamigozr-stub up -d`.
+  # Requires a one-time blob extraction from real GamigoZR:
+  #   1. Run the real `gamigozr` service once (above), or run
+  #      GamigoZR.exe on a Windows host directly.
+  #   2. `curl http://127.0.0.1:58492/ > gamigozr-response.txt`
+  #   3. Place gamigozr-response.txt next to this compose file.
+  # The stub then serves that exact blob on every request -- byte-
+  # identical to real GamigoZR, no Wine, ~10 MB image.
+  gamigozr-stub:
+    image: fiesta-gamigozr-stub:latest
+    profiles: ["gamigozr-stub"]
+    restart: on-failure
+    network_mode: host
+    volumes:
+      - ./gamigozr-response.txt:/etc/gamigozr/response.txt:ro
 
   # --- DB bridge processes ---
   account:

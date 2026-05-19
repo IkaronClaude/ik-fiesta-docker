@@ -6,6 +6,9 @@ HANDOVER.md
 # Claude Code session state
 .claude/
 
+# Operator-extracted GamigoZR crypt blob (BYO; do not commit)
+gamigozr-response.txt
+
 # Example stack runtime state
 example/serverinfo/
 example/.env

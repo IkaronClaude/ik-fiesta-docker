@@ -1,0 +1,47 @@
+# fiesta-gamigozr-stub: drop-in replacement for the .NET GamigoZR.exe
+# zone-response service. Plain nginx serving a single operator-mounted
+# crypt blob at 127.0.0.1:58492. See gamigozr-stub.nginx.conf for the
+# server-side rationale.
+#
+# Why this exists:
+#   GamigoZR.exe is a 15 KB anti-cheat/version-stamp HTTP service that
+#   every Zone process queries once at boot. The response is a static
+#   ~2.7 KB blob keyed off the operator's region; the .exe doesn't
+#   actually do any per-request computation. Running it under Wine in
+#   its own container is fine but heavy (Wine prefix, services.exe,
+#   ~200 MB image) for what could be 5 lines of nginx config.
+#
+# How to extract the blob from a real GamigoZR (one-shot per region):
+#   1. Run the operator's GamigoZR.exe (Windows host or in a Wine
+#      container) so it listens on 127.0.0.1:58492.
+#   2. curl http://127.0.0.1:58492/ > response.txt
+#      Any URL works; the response is URL-agnostic.
+#   3. Save response.txt next to your compose file (or wherever).
+#
+# How to run:
+#   docker run --rm --network host \
+#       -v ./response.txt:/etc/gamigozr/response.txt:ro \
+#       fiesta-gamigozr-stub:latest
+#
+# Zone.exe will GET /GR.php?act=boot&title=Fiesta&... and receive the
+# operator's static blob, identical to what real GamigoZR would have
+# returned. No copyrighted GamigoZR code or data ships in this image.
+
+FROM nginx:alpine
+
+COPY gamigozr-stub.nginx.conf /etc/nginx/conf.d/default.conf
+
+# Pre-create the mount point. The bind mount overlays /etc/gamigozr at
+# runtime; if the operator forgets to mount, the directory exists but
+# response.txt doesn't, and nginx returns 502 -- a loud, visible
+# failure mode in Zone's startup logs.
+RUN mkdir -p /etc/gamigozr
+
+# Drop the bundled stock nginx html to keep the image lean.
+RUN rm -rf /usr/share/nginx/html
+
+EXPOSE 58492
+
+LABEL org.opencontainers.image.title="fiesta-gamigozr-stub" \
+      org.opencontainers.image.description="nginx stub for Fiesta Online's GamigoZR zone-response HTTP service. Operator supplies the crypt blob; ships no copyrighted data." \
+      org.opencontainers.image.source="https://github.com/IkaronClaude/fiesta-docker"
