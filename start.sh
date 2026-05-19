@@ -103,6 +103,38 @@ if [ -z "${SERVICE_NAME:-}" ]; then
     fi
 fi
 
+# --- Auto-seed per-container ServerInfo overlay ---
+# Each container expects ${FIESTA_PATH}/9Data/ServerInfo to be a
+# WRITABLE per-container copy so the config-rewrite step below can
+# substitute PUBLIC_IP / SA_PASSWORD / ODBC strings per process without
+# races between containers sharing the same source mount.
+#
+# In docker-compose this used to be done by a one-shot `init` service
+# (alpine + cp). We do it here so each container is self-contained --
+# no orchestration init step required. Kubernetes friendly: a single
+# pod with two volumes (read-only source + emptyDir for the overlay)
+# bootstraps itself with no initContainer.
+#
+# Convention: if ${SERVERINFO_SEED_DIR} (default /source/9Data/ServerInfo)
+# is a directory and the overlay is empty, copy its contents in.
+# Operator-side: add a second read-only mount of the source folder, e.g.
+#   -v ${FIESTA_SERVER}:/source:ro
+# If neither overlay nor seed dir is set up, we skip silently -- legacy
+# init-container workflow keeps working.
+: "${SERVERINFO_SEED_DIR:=/source/9Data/ServerInfo}"
+OVERLAY_DIR="${FIESTA_PATH}/9Data/ServerInfo"
+if [ -d "${OVERLAY_DIR}" ] && [ -z "$(ls -A "${OVERLAY_DIR}" 2>/dev/null)" ]; then
+    if [ -d "${SERVERINFO_SEED_DIR}" ]; then
+        echo "Seeding ${OVERLAY_DIR} <- ${SERVERINFO_SEED_DIR}"
+        cp -r "${SERVERINFO_SEED_DIR}/." "${OVERLAY_DIR}/"
+    else
+        echo "WARN: ${OVERLAY_DIR} is empty and ${SERVERINFO_SEED_DIR} is not"
+        echo "      mounted -- the per-process config #include will fail at"
+        echo "      exe startup. Either pre-populate the overlay or mount the"
+        echo "      source ServerInfo at ${SERVERINFO_SEED_DIR}."
+    fi
+fi
+
 # Wine can't mmap a PE file with PROT_EXEC over a Windows-host bind mount
 # (Docker Desktop on Windows uses 9P/Plan-9 to back the mount, which doesn't
 # honour exec). Symptom: every server exe page-faults at the first instruction.

@@ -22,6 +22,10 @@
 #   * ODBC SERVER=.\SQLEXPRESS   -> SERVER=127.0.0.1,1433
 #   * ODBC PWD=<hardcoded>       -> PWD=${SA_PASSWORD}
 #   * (if PUBLIC_IP is set) SERVER_INFO rows tagged "; PUBLIC_IP" get rewritten
+#
+# Each container also self-seeds its per-container 9Data/ServerInfo overlay
+# on first start (from /source:ro, a second read-only mount of the same
+# server folder). No init container required -- works the same way in k8s.
 
 x-fiesta-env: &fiesta-env
   SA_PASSWORD: "${SA_PASSWORD:?SA_PASSWORD not set. Put it in a .env file.}"
@@ -36,31 +40,6 @@ x-fiesta: &fiesta
   network_mode: host
 
 services:
-  # --- One-shot: populate per-container 9Data/ServerInfo overlays ---
-  # _ServerGroup.txt needs to be individually writable per game service, and
-  # ServerInfo.txt is rewritten per container -- so each service gets its own
-  # writable copy of 9Data/ServerInfo/. This service seeds those copies from
-  # FIESTA_SERVER on the first run, then exits.
-  init:
-    image: alpine:3.20
-    restart: "no"
-    volumes:
-      - ${FIESTA_SERVER:?FIESTA_SERVER not set. Put it in a .env file.}:/source:ro
-      - ./serverinfo:/dest
-    command:
-      - sh
-      - -c
-      - |
-        set -e
-        for svc in account accountlog character gamelog login worldmanager \
-                   zone00 zone01 zone02 zone03 zone04 gamigozr; do
-          mkdir -p /dest/$$svc
-          if [ -z "$$(ls -A /dest/$$svc 2>/dev/null)" ]; then
-            cp -r /source/9Data/ServerInfo/. /dest/$$svc/
-            echo "init: populated /dest/$$svc"
-          fi
-        done
-
   sqlserver:
     image: fiesta-sql-runtime:latest
     restart: on-failure
@@ -76,7 +55,7 @@ services:
       #   docker volume rm fiesta-docker-example_sql-data
       # See README.md "What happens on `docker compose down`?" for details.
       - sql-data:/var/opt/mssql
-      - ${FIESTA_SERVER:?}/Databases:/var/opt/mssql/backup:ro
+      - ${FIESTA_SERVER:?FIESTA_SERVER not set. Put it in a .env file.}/Databases:/var/opt/mssql/backup:ro
     healthcheck:
       test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$SA_PASSWORD\" -C -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S 127.0.0.1 -U sa -P \"$$SA_PASSWORD\" -C -Q 'SELECT 1'"]
       interval: 10s
@@ -91,17 +70,15 @@ services:
   # pre-extracted crypt blob -- see the `gamigozr-stub` block below.
   gamigozr:
     <<: *fiesta
-    profiles: ["", "real-gamigozr"]   # default profile
+    profiles: ["", "real-gamigozr"]
     command: ["GamigoZR/GamigoZR.exe"]
     environment:
       <<: *fiesta-env
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/gamigozr:/fiesta/9Data/ServerInfo
-    depends_on:
-      init:
-        condition: service_completed_successfully
 
   # Opt in with: `docker compose --profile gamigozr-stub up -d`.
   # Requires a one-time blob extraction from real GamigoZR:
@@ -127,12 +104,11 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/account:/fiesta/9Data/ServerInfo
     depends_on:
       sqlserver:
         condition: service_healthy
-      init:
-        condition: service_completed_successfully
 
   accountlog:
     <<: *fiesta
@@ -141,12 +117,11 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/accountlog:/fiesta/9Data/ServerInfo
     depends_on:
       sqlserver:
         condition: service_healthy
-      init:
-        condition: service_completed_successfully
 
   character:
     <<: *fiesta
@@ -155,12 +130,11 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/character:/fiesta/9Data/ServerInfo
     depends_on:
       sqlserver:
         condition: service_healthy
-      init:
-        condition: service_completed_successfully
 
   gamelog:
     <<: *fiesta
@@ -169,12 +143,11 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/gamelog:/fiesta/9Data/ServerInfo
     depends_on:
       sqlserver:
         condition: service_healthy
-      init:
-        condition: service_completed_successfully
 
   # --- Game processes ---
   login:
@@ -184,6 +157,7 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/login:/fiesta/9Data/ServerInfo
     depends_on:
       account:
@@ -202,6 +176,7 @@ services:
       <<: *fiesta-env
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/worldmanager:/fiesta/9Data/ServerInfo
     depends_on:
       account:
@@ -222,6 +197,7 @@ services:
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/zone00:/fiesta/9Data/ServerInfo
     depends_on:
       worldmanager:
@@ -237,6 +213,7 @@ services:
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/zone01:/fiesta/9Data/ServerInfo
     depends_on:
       worldmanager:
@@ -252,6 +229,7 @@ services:
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/zone02:/fiesta/9Data/ServerInfo
     depends_on:
       worldmanager:
@@ -267,6 +245,7 @@ services:
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/zone03:/fiesta/9Data/ServerInfo
     depends_on:
       worldmanager:
@@ -282,6 +261,7 @@ services:
       START_GAMIGOZR: "0"
     volumes:
       - ${FIESTA_SERVER:?}:/fiesta
+      - ${FIESTA_SERVER:?}:/source:ro
       - ./serverinfo/zone04:/fiesta/9Data/ServerInfo
     depends_on:
       worldmanager:

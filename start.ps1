@@ -50,8 +50,6 @@ $processDir    = Join-Path $fiestaPath $processRelDir
 $exePath       = Join-Path $processDir $processExe
 $dirName       = Split-Path $processRelDir -Leaf
 
-$serviceName = if ($env:SERVICE_NAME) { $env:SERVICE_NAME } else { "_$dirName" }
-
 if (-not (Test-Path $fiestaPath -PathType Container)) {
     Write-Error "FIESTA_PATH ($fiestaPath) is not a directory. Mount your server folder, e.g.: -v C:\host\fiesta-server:$fiestaPath"
     exit 1
@@ -66,6 +64,51 @@ if (-not (Test-Path $exePath -PathType Leaf)) {
         Get-ChildItem $fiestaPath -Force | ForEach-Object { Write-Host ("    {0}" -f $_.Name) }
     }
     exit 1
+}
+
+# --- Discover SERVICE_NAME ---
+# Mirrors start.sh: Fiesta exes embed their expected SCM service name in a
+# per-process *ServerInfo.txt `MY_SERVER "_Name", ...` line. Registering
+# under any other name triggers a "service upload only" code path that
+# self-registers the expected name and exits, forcing a restart cycle.
+# Reading the embedded name avoids that whether we're on Linux/Wine or
+# native Windows SCM. Operator-supplied SERVICE_NAME (env) wins.
+if (-not $env:SERVICE_NAME) {
+    $myServerMatch = Get-ChildItem -Path $processDir -Filter '*.txt' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+        Select-String -Pattern '^\s*MY_SERVER\s+"([^"]+)"' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($myServerMatch -and $myServerMatch.Matches[0].Groups[1].Value) {
+        $serviceName = $myServerMatch.Matches[0].Groups[1].Value
+        Write-Host "  SERVICE_NAME discovered from MY_SERVER: $serviceName"
+    } else {
+        $serviceName = "_$dirName"
+        Write-Host "  SERVICE_NAME fallback (no MY_SERVER in *.txt): $serviceName"
+    }
+} else {
+    $serviceName = $env:SERVICE_NAME
+}
+
+# --- Auto-seed per-container ServerInfo overlay ---
+# See start.sh for the full rationale; the short version is that each
+# container needs a writable per-container copy of 9Data\ServerInfo so
+# the rewrite step below can mutate it without racing other containers.
+# Previously a one-shot `init` service in compose did this; doing it here
+# makes each container self-contained (no init step in k8s either).
+#
+# Operator mounts the source folder a second time read-only:
+#   -v C:\path\to\Server:C:\source:ro
+# Default seed source is C:\source\9Data\ServerInfo; override via env
+# SERVERINFO_SEED_DIR.
+$serverInfoSeedDir = if ($env:SERVERINFO_SEED_DIR) { $env:SERVERINFO_SEED_DIR } else { 'C:\source\9Data\ServerInfo' }
+$overlayDir        = Join-Path $fiestaPath '9Data\ServerInfo'
+if ((Test-Path $overlayDir -PathType Container) -and
+    -not (Get-ChildItem $overlayDir -Force -ErrorAction SilentlyContinue)) {
+    if (Test-Path $serverInfoSeedDir -PathType Container) {
+        Write-Host "Seeding $overlayDir <- $serverInfoSeedDir"
+        Copy-Item -Path (Join-Path $serverInfoSeedDir '*') -Destination $overlayDir -Recurse -Force
+    } else {
+        Write-Warning "$overlayDir is empty and $serverInfoSeedDir is not mounted -- per-process config #include will fail."
+    }
 }
 
 Write-Host "=== Fiesta runtime (Windows) ==="
