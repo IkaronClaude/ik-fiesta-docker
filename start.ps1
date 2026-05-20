@@ -98,6 +98,24 @@ if (-not $env:SERVICE_NAME) {
     $serviceName = $env:SERVICE_NAME
 }
 
+# Pull (type, world, zone) out of the MY_SERVER line. Those three
+# integers are how Fiesta identifies a service in SERVER_INFO -- each
+# SERVER_INFO row in ServerInfo.txt has the same triple in positions
+# 2-4 after the label. Config-driven match means no hardcoded label
+# tables; if Mimir adds a new world or zone, this still works.
+$script:myType = $null
+$script:myWorld = $null
+$script:myZone = $null
+$mstMatch = Get-ChildItem -Path $processDir -Filter '*.txt' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+    Select-String -Pattern '^\s*MY_SERVER\s+"[^"]+"\s*,\s*"[^"]+"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)' -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+if ($mstMatch) {
+    $script:myType  = $mstMatch.Matches[0].Groups[1].Value
+    $script:myWorld = $mstMatch.Matches[0].Groups[2].Value
+    $script:myZone  = $mstMatch.Matches[0].Groups[3].Value
+    Write-Host "  MY_SERVER triple: type=$myType world=$myWorld zone=$myZone"
+}
+
 # --- Decide whether this container should host an in-process GamigoZR ---
 # Zones need a /GR.php-on-127.0.0.1:58492 HTTP response from GamigoZR; on
 # Linux host networking a sibling gamigozr container provides it, but
@@ -238,23 +256,50 @@ function Rewrite-ConfigFile {
         $line = $lines[$i]
 
         if ($line -match '^\s*SERVER_INFO\s') {
-            if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"[^"]*)"([^"]+)"(.*)$') {
+            # Full positional parse so we can match on (type, world, zone)
+            # and inspect the "id" (5th int, =20 for client-facing rows).
+            #   SERVER_INFO "label", type, world, zone, idKind, "ip", port, ...
+            if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*)"([^"]+)"(.*)$') {
                 $prefix      = $Matches[1]
-                $existingVal = $Matches[2]
-                $suffix      = $Matches[3]
+                $rowType     = $Matches[2]
+                $rowWorld    = $Matches[3]
+                $rowZone     = $Matches[4]
+                $rowIdKind   = $Matches[5]
+                $existingVal = $Matches[6]
+                $suffix      = $Matches[7]
                 $newVal      = $existingVal
 
-                # If the IP column holds a hostname (not a literal IP),
-                # resolve it. Operator-templated names like "login" or
-                # "sqlserver" become the resolved container IP at runtime.
-                $resolved = Resolve-HostnameOrNull $existingVal
-                if ($resolved) { $newVal = $resolved }
+                $isOwn    = ($myType -and $rowType -eq $myType -and $rowWorld -eq $myWorld -and $rowZone -eq $myZone)
+                $isPublic = ($rowIdKind -eq '20')
 
-                # PUBLIC_IP-tagged rows: env-supplied PUBLIC_IP wins over
-                # whatever was there (used for the client-facing IP that
-                # external clients connect to).
-                if ($publicIp -and $line -match ';.*PUBLIC_IP') {
-                    $newVal = $publicIp
+                if ($isOwn -and $isPublic) {
+                    # Our client-facing port: bind 0.0.0.0 (all
+                    # interfaces). Universal across deployment styles:
+                    #   * docker -p via userland-proxy hits container
+                    #     loopback OR eth0 -- 0.0.0.0 covers both
+                    #   * Linux native docker / k8s with DNAT (traefik,
+                    #     kube-proxy) forwards external_ip:port to
+                    #     container_ip:port -- 0.0.0.0 is listening
+                    #   * Sibling containers via docker DNS connect to
+                    #     container_ip:port -- also caught
+                    # Verified on Windows containers (Login/WM/zones +
+                    # DB bridges all SERVICE START with 0.0.0.0).
+                    $newVal = '0.0.0.0'
+                }
+                elseif ((-not $isOwn) -and $isPublic) {
+                    # Someone else's client-facing port. We're not binding
+                    # this -- we ADVERTISE it (Login tells the client "go
+                    # to PG_W00_WM at this IP/port"). Use operator's real
+                    # public IP so the client can reach it from outside.
+                    if ($publicIp) { $newVal = $publicIp }
+                }
+                else {
+                    # LOCALHOST-tagged rows (s2s, OPTOOL). DNS-resolve the
+                    # hostname in the IP column to the sibling container's
+                    # current docker IP. For own LOCALHOST rows this lands
+                    # our own container IP; other services connect to it.
+                    $resolved = Resolve-HostnameOrNull $existingVal
+                    if ($resolved) { $newVal = $resolved }
                 }
 
                 if ($newVal -ne $existingVal) {
@@ -305,33 +350,17 @@ function Rewrite-ConfigFile {
     }
 }
 
-# Auto-detect PUBLIC_IP if unset. Fiesta servers bind() the IP they advertise
-# in ServerInfo.txt, so whatever we write there has to exist on a local
-# interface inside this container -- otherwise bind fails with WSAEADDRNOTAVAIL
-# and the service never comes up. The source address for default-route traffic
-# is the host LAN IP (the one external clients use to reach us). Detect that
-# and use it as the default PUBLIC_IP so operators don't have to guess.
+# PUBLIC_IP must be set to the operator's WAN IP (the address external
+# clients reach the server via). Purely an ADVERTISE value: written
+# into other services' client-facing rows so Login can tell the client
+# "go to WM/Zone at THIS IP". Containers never bind PUBLIC_IP. Auto-
+# detecting from a bridged-network container would pick the docker
+# subnet IP, useless to external clients -- so we fail loudly.
 if (-not $publicIp) {
-    $detected = $null
-    try {
-        $route = Find-NetRoute -RemoteIPAddress 1.1.1.1 -ErrorAction Stop | Select-Object -First 1
-        if ($route -and $route.IPAddress) { $detected = $route.IPAddress }
-    } catch { }
-    if (-not $detected) {
-        try {
-            $detected = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-                Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-                Sort-Object -Property InterfaceMetric |
-                Select-Object -First 1).IPAddress
-        } catch { }
-    }
-    if ($detected) {
-        $publicIp = $detected
-        Write-Host "  PUBLIC_IP auto-detected: $publicIp"
-    } else {
-        Write-Host "  PUBLIC_IP not set and auto-detect failed -- SERVER_INFO rows unchanged."
-    }
+    Write-Error "PUBLIC_IP env is required. Set it to your server's WAN/public IP (e.g. 12.34.56.78). It's advertised to clients via SERVER_INFO; containers don't connect to it themselves."
+    exit 1
 }
+
 
 Write-Host "Walking config includes from $processDir..."
 $includes = @(Get-IncludePaths -cfgDir $processDir)

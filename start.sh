@@ -21,6 +21,8 @@ set -eo pipefail
 : "${FIESTA_PATH:=/fiesta}"
 : "${START_GAMIGOZR:=auto}"
 : "${GAMIGOZR_DIR:=GamigoZR}"
+: "${IS_ZONE:=auto}"
+: "${CRYPT_BLOB_PATH:=/etc/gamigozr/response.txt}"
 : "${KEEP_ALIVE:=0}"
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
@@ -103,6 +105,21 @@ if [ -z "${SERVICE_NAME:-}" ]; then
     fi
 fi
 
+# Also pull (type, world, zone) -- the 3 integers after the two service-
+# name strings on the MY_SERVER line. Each SERVER_INFO row in
+# ServerInfo.txt has the same triple in positions 2-4 after its label;
+# we use that to match "own" rows vs "others'" rows for the PUBLIC_IP
+# rewrite below. Config-driven, no hardcoded service->label table.
+MY_TYPE=""; MY_WORLD=""; MY_ZONE=""
+MY_TRIPLE=$(find "${SOURCE_DIR}" -maxdepth 3 -type f -name '*.txt' \
+    -exec grep -hE '^[[:space:]]*MY_SERVER[[:space:]]+"' {} + 2>/dev/null \
+    | head -1 \
+    | sed -nE 's/^[[:space:]]*MY_SERVER[[:space:]]+"[^"]+"[[:space:]]*,[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+).*/\1 \2 \3/p') || true
+if [ -n "${MY_TRIPLE}" ]; then
+    read -r MY_TYPE MY_WORLD MY_ZONE <<< "${MY_TRIPLE}"
+    echo "  MY_SERVER triple: type=${MY_TYPE} world=${MY_WORLD} zone=${MY_ZONE}"
+fi
+
 # --- Auto-seed per-container ServerInfo overlay ---
 # Each container expects ${FIESTA_PATH}/9Data/ServerInfo to be a
 # WRITABLE per-container copy so the config-rewrite step below can
@@ -123,16 +140,23 @@ fi
 # init-container workflow keeps working.
 : "${SERVERINFO_SEED_DIR:=/source/9Data/ServerInfo}"
 OVERLAY_DIR="${FIESTA_PATH}/9Data/ServerInfo"
-if [ -d "${OVERLAY_DIR}" ] && [ -z "$(ls -A "${OVERLAY_DIR}" 2>/dev/null)" ]; then
-    if [ -d "${SERVERINFO_SEED_DIR}" ]; then
-        echo "Seeding ${OVERLAY_DIR} <- ${SERVERINFO_SEED_DIR}"
-        cp -r "${SERVERINFO_SEED_DIR}/." "${OVERLAY_DIR}/"
-    else
-        echo "WARN: ${OVERLAY_DIR} is empty and ${SERVERINFO_SEED_DIR} is not"
-        echo "      mounted -- the per-process config #include will fail at"
-        echo "      exe startup. Either pre-populate the overlay or mount the"
-        echo "      source ServerInfo at ${SERVERINFO_SEED_DIR}."
-    fi
+# Re-seed on EVERY start (not just when empty). ServerInfo.txt's
+# SERVER_INFO rows have docker hostnames in the IP column ("login",
+# "worldmanager", "sqlserver", ...); start.sh's rewrite below resolves
+# them to container IPs and writes the IPs back. On a container
+# restart docker can assign a new IP, but the overlay still has the
+# OLD IP from the previous run -- the exe then tries to bind an IP
+# that isn't its own and Listen_Add fails. Always re-seeding from the
+# hostname template guarantees a clean slate for the rewrite step.
+if [ -d "${OVERLAY_DIR}" ] && [ -d "${SERVERINFO_SEED_DIR}" ]; then
+    echo "Re-seeding ${OVERLAY_DIR} <- ${SERVERINFO_SEED_DIR}"
+    rm -rf "${OVERLAY_DIR:?}"/* 2>/dev/null || true
+    cp -r "${SERVERINFO_SEED_DIR}/." "${OVERLAY_DIR}/"
+elif [ -d "${OVERLAY_DIR}" ] && [ -z "$(ls -A "${OVERLAY_DIR}" 2>/dev/null)" ]; then
+    echo "WARN: ${OVERLAY_DIR} is empty and ${SERVERINFO_SEED_DIR} is not"
+    echo "      mounted -- the per-process config #include will fail at"
+    echo "      exe startup. Either pre-populate the overlay or mount the"
+    echo "      source ServerInfo at ${SERVERINFO_SEED_DIR}."
 fi
 
 # Wine can't mmap a PE file with PROT_EXEC over a Windows-host bind mount
@@ -208,6 +232,21 @@ collect_includes() {
     } | sort -u
 }
 
+resolve_hostname_or_empty() {
+    # Echo a resolved IPv4 if the arg is a hostname that resolves to one,
+    # else echo empty. If the arg is already an IPv4, also echo empty
+    # (caller can detect "no rewrite needed").
+    local name="$1"
+    [ -z "$name" ] && return 0
+    if [[ "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    # getent hosts emits "<ip> <name>" on success.
+    local ip
+    ip=$(getent hosts "$name" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$ip" ] && echo "$ip"
+}
+
 rewrite_config_file() {
     local file="$1"
     local tmp="${file}.tmp.$$"
@@ -220,25 +259,69 @@ rewrite_config_file() {
         return 1
     fi
 
-    local line is_public
+    local line row_type row_world row_zone row_id ip_field new_ip resolved
     while IFS= read -r line || [ -n "${line}" ]; do
-        if [[ "${line}" =~ ^[[:space:]]*SERVER_INFO[[:space:]] ]] && [ -n "${PUBLIC_IP:-}" ]; then
-            # Trailing comment marker: "; PUBLIC_IP" (or LOCALHOST). Only rewrite
-            # the IP field if the operator tagged this row as the client-facing one.
-            is_public=0
-            if [[ "${line}" == *";"*PUBLIC_IP* ]]; then is_public=1; fi
-            if [ "${is_public}" -eq 1 ]; then
-                # Replace the 2nd quoted string on the line (the IP field).
-                if [[ "${line}" =~ ^([[:space:]]*SERVER_INFO[[:space:]]+\"[^\"]+\"[^\"]*)\"([^\"]+)\"(.*)$ ]]; then
-                    if [ "${BASH_REMATCH[2]}" != "${PUBLIC_IP}" ]; then
-                        line="${BASH_REMATCH[1]}\"${PUBLIC_IP}\"${BASH_REMATCH[3]}"
-                        changed=1
-                    fi
+        if [[ "${line}" =~ ^[[:space:]]*SERVER_INFO[[:space:]] ]]; then
+            # Full positional parse:
+            #   SERVER_INFO  "label", type, world, zone, idKind, "ip", port, ...
+            # Position 5 (idKind) = 20 means client-facing. Positions 2-4
+            # are matched against our MY_SERVER (type, world, zone) to
+            # decide if this row describes US or another service.
+            if [[ "${line}" =~ ^([[:space:]]*SERVER_INFO[[:space:]]+\"[^\"]+\"[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*)\"([^\"]+)\"(.*)$ ]]; then
+                local prefix="${BASH_REMATCH[1]}"
+                row_type="${BASH_REMATCH[2]}"
+                row_world="${BASH_REMATCH[3]}"
+                row_zone="${BASH_REMATCH[4]}"
+                row_id="${BASH_REMATCH[5]}"
+                ip_field="${BASH_REMATCH[6]}"
+                local suffix="${BASH_REMATCH[7]}"
+                new_ip="${ip_field}"
+
+                local is_own=0 is_public=0
+                if [ -n "${MY_TYPE}" ] \
+                   && [ "${row_type}" = "${MY_TYPE}" ] \
+                   && [ "${row_world}" = "${MY_WORLD}" ] \
+                   && [ "${row_zone}" = "${MY_ZONE}" ]; then is_own=1; fi
+                if [ "${row_id}" = "20" ]; then is_public=1; fi
+
+                if [ "${is_own}" -eq 1 ] && [ "${is_public}" -eq 1 ]; then
+                    # Our client-facing port: bind 0.0.0.0 (all interfaces).
+                    # Universal across deployment styles -- docker -p
+                    # userland-proxy, native DNAT, traefik/kube-proxy all
+                    # forward to a path we're listening on. Verified on
+                    # Windows containers that all Fiesta exes (Login/WM/
+                    # zones + DB bridges) accept INADDR_ANY.
+                    new_ip="0.0.0.0"
+                elif [ "${is_own}" -ne 1 ] && [ "${is_public}" -eq 1 ]; then
+                    # Another service's client-facing port. We don't bind
+                    # this -- we ADVERTISE it (Login telling the client
+                    # "now go to WM at this IP"). Operator's real WAN IP.
+                    new_ip="${PUBLIC_IP}"
+                else
+                    # LOCALHOST-tagged (s2s, OPTOOL). DNS-resolve the
+                    # hostname in the IP column to a sibling container's
+                    # current docker IP. For own LOCALHOST rows this is
+                    # our own container IP; for others' it's theirs.
+                    resolved="$(resolve_hostname_or_empty "${ip_field}")"
+                    [ -n "${resolved}" ] && new_ip="${resolved}"
+                fi
+
+                if [ "${new_ip}" != "${ip_field}" ]; then
+                    line="${prefix}\"${new_ip}\"${suffix}"
+                    changed=1
                 fi
             fi
         elif [[ "${line}" == *ODBC_INFO* ]]; then
             if [[ "${line}" == *"SERVER=.\\SQLEXPRESS"* ]]; then
                 line="${line//SERVER=.\\SQLEXPRESS/SERVER=${SQL_HOST},${SQL_PORT}}"
+                changed=1
+            fi
+            # Also rewrite SERVER=127.0.0.1,<port> (literal-IP form) when
+            # the operator set SQL_HOST to a different host (sibling
+            # container under docker DNS, etc.). Idempotent: if SQL_HOST
+            # defaults to 127.0.0.1, the substitution is a no-op.
+            if [[ "${line}" =~ SERVER=127\.0\.0\.1,[0-9]+ ]]; then
+                line=$(echo "${line}" | sed -E "s|SERVER=127\.0\.0\.1,[0-9]+|SERVER=${SQL_HOST},${SQL_PORT}|")
                 changed=1
             fi
             if [ "${ODBC_DRIVER}" != "SQL Server" ] && [[ "${line}" == *"DRIVER={SQL Server}"* ]]; then
@@ -270,44 +353,19 @@ rewrite_config_file() {
     fi
 }
 
-# Auto-detect PUBLIC_IP if unset. Fiesta servers bind() the IP they advertise
-# in ServerInfo.txt, so whatever we write there has to be an IP that actually
-# exists on a local interface inside this container -- otherwise bind fails
-# with EADDRNOTAVAIL and the service never comes up. On a native Linux Docker
-# host (or k8s), the default-route source IP is the host LAN IP, which is
-# both bindable and what off-host clients use to reach us. Perfect.
-#
-# Docker Desktop on Mac/Windows is the awkward case: even with the "Host
-# networking" toggle on, the container sees only Docker Desktop's internal
-# Linux VM (eth0 = 192.168.65.0/24), NOT the Windows/Mac NIC. The only IP
-# both bindable here and reachable from the host is 127.0.0.1 -- the toggle
-# forwards localhost binds back to the host. Off-host LAN clients CAN'T
-# reach the server in that setup; for a publicly-accessible deployment use
-# a native Linux Docker / k8s host.
+# PUBLIC_IP must be set to the operator's WAN IP (the address external
+# clients reach the server via -- a proxy/port-forward then delivers to
+# the right container). It is purely an ADVERTISE value: written into
+# other services' client-facing SERVER_INFO rows so Login can tell the
+# client "now connect to WM/Zone at THIS IP". Containers don't bind to
+# PUBLIC_IP. Auto-detecting from a bridge-networked container would
+# pick the docker subnet IP, useless for external clients -- so we fail
+# loudly if it's missing.
 if [ -z "${PUBLIC_IP:-}" ]; then
-    DETECTED_IP=""
-    if command -v ip >/dev/null 2>&1; then
-        DETECTED_IP=$(ip route get 1.1.1.1 2>/dev/null \
-            | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-    fi
-    if [ -z "${DETECTED_IP}" ] && command -v hostname >/dev/null 2>&1; then
-        DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    fi
-    if [[ "${DETECTED_IP}" == 192.168.65.* ]]; then
-        echo "  PUBLIC_IP auto-detect: container is on Docker Desktop's internal VM"
-        echo "    subnet (${DETECTED_IP}). Off-host clients can't reach that IP; using"
-        echo "    127.0.0.1 instead, which Docker Desktop's host-networking toggle"
-        echo "    forwards back to the Mac/Windows host. For LAN-accessible servers,"
-        echo "    deploy on native Linux Docker / k8s."
-        DETECTED_IP="127.0.0.1"
-    fi
-    if [ -n "${DETECTED_IP}" ]; then
-        PUBLIC_IP="${DETECTED_IP}"
-        export PUBLIC_IP
-        echo "  PUBLIC_IP auto-detected: ${PUBLIC_IP}"
-    else
-        echo "  PUBLIC_IP not set and auto-detect failed -- SERVER_INFO rows unchanged."
-    fi
+    echo "ERROR: PUBLIC_IP env is required. Set it to your server's WAN/public IP" >&2
+    echo "       (e.g. PUBLIC_IP=12.34.56.78). It's advertised to clients via" >&2
+    echo "       SERVER_INFO rows; containers don't connect to it themselves." >&2
+    exit 1
 fi
 
 echo "Walking config includes from ${PROCESS_DIR}..."
@@ -375,7 +433,49 @@ should_start_gamigozr() {
     esac
 }
 
-if should_start_gamigozr; then
+# --- In-container GamigoZR HTTP stub (zones, no separate container) ---
+# IS_ZONE = 1 | 0 | auto. `auto` triggers on Zone.exe. When on AND
+# ${CRYPT_BLOB_PATH} exists, launch nginx serving the operator-mounted
+# crypt blob on 127.0.0.1:58492. Mirrors start.ps1's HttpListener stub
+# so the same compose works on both engines without a sibling gamigozr
+# container (which wouldn't be reachable at 127.0.0.1 from another
+# container anyway).
+is_zone_active() {
+    case "${IS_ZONE}" in
+        1)    return 0 ;;
+        0)    return 1 ;;
+        auto) [ "${PROCESS_EXE}" = "Zone.exe" ] && return 0 || return 1 ;;
+        *)    [ "${PROCESS_EXE}" = "Zone.exe" ] && return 0 || return 1 ;;
+    esac
+}
+
+STUB_STARTED=0
+if is_zone_active; then
+    if [ -f "${CRYPT_BLOB_PATH}" ]; then
+        mkdir -p /etc/gamigozr
+        # Symlink the operator blob into the nginx-served location. The
+        # baked /etc/nginx/conf.d/gamigozr-stub.conf serves
+        # /etc/gamigozr/response.txt for every URL.
+        if [ "$(readlink -f "${CRYPT_BLOB_PATH}" 2>/dev/null)" != "$(readlink -f /etc/gamigozr/response.txt 2>/dev/null)" ]; then
+            ln -sf "${CRYPT_BLOB_PATH}" /etc/gamigozr/response.txt
+        fi
+        echo "Starting GamigoZR stub on 127.0.0.1:58492 (blob: ${CRYPT_BLOB_PATH})..."
+        nginx -g 'daemon off;' &
+        echo "  GamigoZR stub nginx pid: $!"
+        STUB_STARTED=1
+    else
+        echo "WARN: IS_ZONE=true but CRYPT_BLOB_PATH (${CRYPT_BLOB_PATH}) not found;"
+        echo "      will try the legacy Wine-hosted GamigoZR.exe path instead."
+    fi
+elif [ -n "${CRYPT_BLOB_PATH:-}" ] && [ -f "${CRYPT_BLOB_PATH}" ]; then
+    echo "NOTE: CRYPT_BLOB_PATH is set but IS_ZONE is false; stub not started."
+    echo "      That mount only matters for Zone containers."
+fi
+
+# Skip the legacy Wine-hosted GamigoZR.exe path if the in-container
+# nginx stub is already serving 58492 -- they would race on the same
+# port and one would silently fail.
+if [ "${STUB_STARTED}" -ne 1 ] && should_start_gamigozr; then
     GAMIGOZR_SRC="${FIESTA_PATH}/${GAMIGOZR_DIR}/GamigoZR.exe"
     if [ -f "${GAMIGOZR_SRC}" ]; then
         # Same bind-mount-exec workaround: copy GamigoZR into /server/ before launch.

@@ -68,8 +68,15 @@ ENV FIESTA_PATH=C:\\fiesta \
     ODBC_DRIVER="SQL Server" \
     START_GAMIGOZR=auto \
     GAMIGOZR_DIR=GamigoZR \
+    IS_ZONE=auto \
+    CRYPT_BLOB_PATH=C:\\gamigozr\\response.txt \
     SERVICE_NAME="" \
     KEEP_ALIVE=0
+
+# Only the client-facing (type-20 / "PUBLIC_IP") ports from ServerInfo.txt
+# need EXPOSE. The other ports (LOCALHOST-tagged sub-ports for s2s and
+# OPTOOL, plus DB-bridge ports) only carry inter-container traffic.
+EXPOSE 9010 9013 9016 9019 9022 9025 9028
 
 LABEL org.opencontainers.image.title="fiesta-server-runtime" \
       org.opencontainers.image.description="Bring-your-own runtime for Fiesta Online server binaries (Windows)" \
