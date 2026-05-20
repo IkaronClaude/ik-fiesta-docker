@@ -232,6 +232,31 @@ collect_includes() {
     } | sort -u
 }
 
+# Fiesta hardcodes a type->service-name mapping in its exes. We mirror it
+# so per-service overrides can be declared as env vars keyed by name
+# (with world/zone suffixes when relevant). Env var conventions:
+#   INTERNAL_HOST_<name>   docker service name for s2s (LOCALHOST rows).
+#                           If unset, fall back to the source row's IP
+#                           column (still DNS-resolved).
+#   EXTERNAL_HOST_<name>   public-facing host for the proxy/operator.
+#                           Used in id=20 rows of OTHER services'
+#                           overlays. Falls back to $PUBLIC_IP.
+#   EXTERNAL_PORT_<name>   public-facing port (proxy listen). Falls back
+#                           to the source row's port.
+fiesta_service_name() {
+    local t="$1" w="$2" z="$3"
+    case "$t" in
+        0) echo "Account" ;;
+        1) echo "AccountLog" ;;
+        2) echo "Character_${w}" ;;
+        3) echo "GameLog_${w}" ;;
+        4) echo "Login" ;;
+        5) echo "WorldManager_${w}" ;;
+        6) echo "Zone_${w}_${z}" ;;
+        *) echo "Type${t}_${w}_${z}" ;;
+    esac
+}
+
 resolve_hostname_or_empty() {
     # Echo a resolved IPv4 if the arg is a hostname that resolves to one,
     # else echo empty. If the arg is already an IPv4, also echo empty
@@ -259,23 +284,24 @@ rewrite_config_file() {
         return 1
     fi
 
-    local line row_type row_world row_zone row_id ip_field new_ip resolved
+    local line row_type row_world row_zone row_id row_port ip_field port_sep prefix suffix
+    local new_ip new_port resolved svc_name var_name ext_host ext_port int_host host_to_resolve
     while IFS= read -r line || [ -n "${line}" ]; do
         if [[ "${line}" =~ ^[[:space:]]*SERVER_INFO[[:space:]] ]]; then
-            # Full positional parse:
-            #   SERVER_INFO  "label", type, world, zone, idKind, "ip", port, ...
-            # Position 5 (idKind) = 20 means client-facing. Positions 2-4
-            # are matched against our MY_SERVER (type, world, zone) to
-            # decide if this row describes US or another service.
-            if [[ "${line}" =~ ^([[:space:]]*SERVER_INFO[[:space:]]+\"[^\"]+\"[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*)\"([^\"]+)\"(.*)$ ]]; then
-                local prefix="${BASH_REMATCH[1]}"
+            # Capture prefix / type / world / zone / idKind / IP / port-sep / port / suffix.
+            #   SERVER_INFO "label", type, world, zone, idKind, "ip", port, ...
+            if [[ "${line}" =~ ^([[:space:]]*SERVER_INFO[[:space:]]+\"[^\"]+\"[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,[[:space:]]*)\"([^\"]+)\"([[:space:]]*,[[:space:]]*)([0-9]+)(.*)$ ]]; then
+                prefix="${BASH_REMATCH[1]}"
                 row_type="${BASH_REMATCH[2]}"
                 row_world="${BASH_REMATCH[3]}"
                 row_zone="${BASH_REMATCH[4]}"
                 row_id="${BASH_REMATCH[5]}"
                 ip_field="${BASH_REMATCH[6]}"
-                local suffix="${BASH_REMATCH[7]}"
+                port_sep="${BASH_REMATCH[7]}"
+                row_port="${BASH_REMATCH[8]}"
+                suffix="${BASH_REMATCH[9]}"
                 new_ip="${ip_field}"
+                new_port="${row_port}"
 
                 local is_own=0 is_public=0
                 if [ -n "${MY_TYPE}" ] \
@@ -284,30 +310,39 @@ rewrite_config_file() {
                    && [ "${row_zone}" = "${MY_ZONE}" ]; then is_own=1; fi
                 if [ "${row_id}" = "20" ]; then is_public=1; fi
 
+                svc_name="$(fiesta_service_name "${row_type}" "${row_world}" "${row_zone}")"
+
                 if [ "${is_own}" -eq 1 ] && [ "${is_public}" -eq 1 ]; then
-                    # Our client-facing port: bind 0.0.0.0 (all interfaces).
-                    # Universal across deployment styles -- docker -p
-                    # userland-proxy, native DNAT, traefik/kube-proxy all
-                    # forward to a path we're listening on. Verified on
-                    # Windows containers that all Fiesta exes (Login/WM/
-                    # zones + DB bridges) accept INADDR_ANY.
+                    # Own client-facing row: bind 0.0.0.0; port unchanged.
                     new_ip="0.0.0.0"
                 elif [ "${is_own}" -ne 1 ] && [ "${is_public}" -eq 1 ]; then
-                    # Another service's client-facing port. We don't bind
-                    # this -- we ADVERTISE it (Login telling the client
-                    # "now go to WM at this IP"). Operator's real WAN IP.
-                    new_ip="${PUBLIC_IP}"
+                    # Other service's client-facing row: ADVERTISE the
+                    # operator's external endpoint. Per-service env var
+                    # if set; else PUBLIC_IP for host, source port for
+                    # port (proxy listens on the same port internally).
+                    var_name="EXTERNAL_HOST_${svc_name}"
+                    ext_host="${!var_name:-}"
+                    if [ -n "${ext_host}" ]; then new_ip="${ext_host}"
+                    else new_ip="${PUBLIC_IP}"
+                    fi
+                    var_name="EXTERNAL_PORT_${svc_name}"
+                    ext_port="${!var_name:-}"
+                    if [ -n "${ext_port}" ]; then new_port="${ext_port}"; fi
                 else
-                    # LOCALHOST-tagged (s2s, OPTOOL). DNS-resolve the
-                    # hostname in the IP column to a sibling container's
-                    # current docker IP. For own LOCALHOST rows this is
-                    # our own container IP; for others' it's theirs.
-                    resolved="$(resolve_hostname_or_empty "${ip_field}")"
-                    [ -n "${resolved}" ] && new_ip="${resolved}"
+                    # LOCALHOST-tagged (s2s/OPTOOL). Prefer per-service
+                    # INTERNAL_HOST env (docker service name); fall back
+                    # to the source row's hostname. Resolve via DNS.
+                    var_name="INTERNAL_HOST_${svc_name}"
+                    int_host="${!var_name:-}"
+                    host_to_resolve="${int_host:-${ip_field}}"
+                    resolved="$(resolve_hostname_or_empty "${host_to_resolve}")"
+                    if [ -n "${resolved}" ]; then new_ip="${resolved}"
+                    elif [ -n "${int_host}" ]; then new_ip="${int_host}"
+                    fi
                 fi
 
-                if [ "${new_ip}" != "${ip_field}" ]; then
-                    line="${prefix}\"${new_ip}\"${suffix}"
+                if [ "${new_ip}" != "${ip_field}" ] || [ "${new_port}" != "${row_port}" ]; then
+                    line="${prefix}\"${new_ip}\"${port_sep}${new_port}${suffix}"
                     changed=1
                 fi
             fi

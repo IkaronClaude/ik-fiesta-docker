@@ -29,6 +29,37 @@ $sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' 
 $saPassword    = $env:SA_PASSWORD
 $odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'SQL Server' }
 
+# Fiesta hardcodes a type->service-name mapping in its exes. We mirror
+# it here so per-service overrides can be declared as env vars keyed
+# by that name (with world/zone suffixes when the service is per-world
+# or per-zone). Matches the SERVER_INFO row's (type, world, zone)
+# triple to a stable identifier the operator can target in compose.
+#
+# Env var conventions (any not set falls through to the defaults below):
+#   INTERNAL_HOST_<name>   docker service name used for s2s (LOCALHOST
+#                           rows). Resolved via DNS at startup. If unset,
+#                           fall back to the IP column in the source
+#                           ServerInfo.txt (current DNS-resolve behavior).
+#   EXTERNAL_HOST_<name>   public-facing host for the proxy/operator
+#                           routing this service. Used for id=20 rows in
+#                           OTHER services' overlays. Falls back to
+#                           $PUBLIC_IP if unset.
+#   EXTERNAL_PORT_<name>   public-facing port (proxy listen). Falls back
+#                           to the source row's port if unset.
+function Get-FiestaServiceName {
+    param([string]$type, [string]$world, [string]$zone)
+    switch ($type) {
+        '0' { return 'Account' }
+        '1' { return 'AccountLog' }
+        '2' { return "Character_$world" }
+        '3' { return "GameLog_$world" }
+        '4' { return 'Login' }
+        '5' { return "WorldManager_$world" }
+        '6' { return "Zone_${world}_${zone}" }
+        default { return "Type${type}_${world}_${zone}" }
+    }
+}
+
 # IS_ZONE / CRYPT_BLOB_PATH: when set, start.ps1 launches an in-process
 # HTTP listener on 127.0.0.1:58492 serving the operator-mounted GamigoZR
 # crypt blob. Eliminates the need for a separate gamigozr container --
@@ -256,54 +287,53 @@ function Rewrite-ConfigFile {
         $line = $lines[$i]
 
         if ($line -match '^\s*SERVER_INFO\s') {
-            # Full positional parse so we can match on (type, world, zone)
-            # and inspect the "id" (5th int, =20 for client-facing rows).
+            # Capture: prefix, type, world, zone, idKind, IP, port-sep, port, suffix
             #   SERVER_INFO "label", type, world, zone, idKind, "ip", port, ...
-            if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*)"([^"]+)"(.*)$') {
-                $prefix      = $Matches[1]
-                $rowType     = $Matches[2]
-                $rowWorld    = $Matches[3]
-                $rowZone     = $Matches[4]
-                $rowIdKind   = $Matches[5]
-                $existingVal = $Matches[6]
-                $suffix      = $Matches[7]
-                $newVal      = $existingVal
+            if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*)"([^"]+)"(\s*,\s*)(\d+)(.*)$') {
+                $prefix       = $Matches[1]
+                $rowType      = $Matches[2]
+                $rowWorld     = $Matches[3]
+                $rowZone      = $Matches[4]
+                $rowIdKind    = $Matches[5]
+                $existingIp   = $Matches[6]
+                $portSep      = $Matches[7]
+                $existingPort = $Matches[8]
+                $suffix       = $Matches[9]
+                $newIp        = $existingIp
+                $newPort      = $existingPort
 
-                $isOwn    = ($myType -and $rowType -eq $myType -and $rowWorld -eq $myWorld -and $rowZone -eq $myZone)
-                $isPublic = ($rowIdKind -eq '20')
+                $isOwn      = ($myType -and $rowType -eq $myType -and $rowWorld -eq $myWorld -and $rowZone -eq $myZone)
+                $isPublic   = ($rowIdKind -eq '20')
+                $svcName    = Get-FiestaServiceName $rowType $rowWorld $rowZone
 
                 if ($isOwn -and $isPublic) {
-                    # Our client-facing port: bind 0.0.0.0 (all
-                    # interfaces). Universal across deployment styles:
-                    #   * docker -p via userland-proxy hits container
-                    #     loopback OR eth0 -- 0.0.0.0 covers both
-                    #   * Linux native docker / k8s with DNAT (traefik,
-                    #     kube-proxy) forwards external_ip:port to
-                    #     container_ip:port -- 0.0.0.0 is listening
-                    #   * Sibling containers via docker DNS connect to
-                    #     container_ip:port -- also caught
-                    # Verified on Windows containers (Login/WM/zones +
-                    # DB bridges all SERVICE START with 0.0.0.0).
-                    $newVal = '0.0.0.0'
+                    # Our client-facing row: bind 0.0.0.0; port unchanged.
+                    $newIp = '0.0.0.0'
                 }
                 elseif ((-not $isOwn) -and $isPublic) {
-                    # Someone else's client-facing port. We're not binding
-                    # this -- we ADVERTISE it (Login tells the client "go
-                    # to PG_W00_WM at this IP/port"). Use operator's real
-                    # public IP so the client can reach it from outside.
-                    if ($publicIp) { $newVal = $publicIp }
+                    # Other service's client-facing row: ADVERTISE the
+                    # operator's external endpoint. Per-service env override
+                    # if set; otherwise PUBLIC_IP for host, source port.
+                    $extHost = [Environment]::GetEnvironmentVariable("EXTERNAL_HOST_${svcName}")
+                    if ($extHost)        { $newIp = $extHost }
+                    elseif ($publicIp)   { $newIp = $publicIp }
+                    $extPort = [Environment]::GetEnvironmentVariable("EXTERNAL_PORT_${svcName}")
+                    if ($extPort)        { $newPort = $extPort }
                 }
                 else {
-                    # LOCALHOST-tagged rows (s2s, OPTOOL). DNS-resolve the
-                    # hostname in the IP column to the sibling container's
-                    # current docker IP. For own LOCALHOST rows this lands
-                    # our own container IP; other services connect to it.
-                    $resolved = Resolve-HostnameOrNull $existingVal
-                    if ($resolved) { $newVal = $resolved }
+                    # LOCALHOST-tagged rows (s2s/OPTOOL). Prefer per-service
+                    # INTERNAL_HOST env (docker service name); fall back to
+                    # the source row's hostname. Resolve via DNS to the
+                    # sibling container's current IP. Port stays internal.
+                    $intHost = [Environment]::GetEnvironmentVariable("INTERNAL_HOST_${svcName}")
+                    $hostToResolve = if ($intHost) { $intHost } else { $existingIp }
+                    $resolved = Resolve-HostnameOrNull $hostToResolve
+                    if ($resolved)  { $newIp = $resolved }
+                    elseif ($intHost) { $newIp = $intHost }
                 }
 
-                if ($newVal -ne $existingVal) {
-                    $lines[$i] = '{0}"{1}"{2}' -f $prefix, $newVal, $suffix
+                if ($newIp -ne $existingIp -or $newPort -ne $existingPort) {
+                    $lines[$i] = '{0}"{1}"{2}{3}{4}' -f $prefix, $newIp, $portSep, $newPort, $suffix
                     $changed = $true
                 }
             }
