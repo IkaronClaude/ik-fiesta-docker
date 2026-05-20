@@ -65,6 +65,15 @@ if ($connectPassword -ne $saPassword) {
     }
 }
 
+# Disable Windows password policy on sa so failed healthcheck attempts
+# (or test logins) can't lock the account out. SQL Express on Windows
+# Server inherits the host's lockout policy by default; a few wrong
+# passwords from compose's healthcheck poll is enough to lock sa, after
+# which the correct password is rejected until manual UNLOCK. CHECK_POLICY
+# also disables expiry and complexity checks -- fine for containerized
+# dev/test instances. Production should set this explicitly.
+sqlcmd -S $sqlInstance -U sa -P $saPassword -C -Q "ALTER LOGIN sa WITH CHECK_POLICY = OFF" *> $null
+
 Write-Host "Enabling remote access..."
 sqlcmd -S $sqlInstance -U sa -P $saPassword -C -Q "EXEC sp_configure 'remote access', 1; RECONFIGURE;" *> $null
 
@@ -122,11 +131,18 @@ else {
             }
         }
 
+        # WITH REPLACE overwrites pre-existing .mdf/.ldf files. Needed
+        # because master DB lives on the container filesystem (lost on
+        # `docker rm` / container recreate) while user .mdf/.ldf files
+        # live in the C:\sql-data volume (persisted). After a recreate
+        # the volume still has the files but master has no reference to
+        # them, and a plain RESTORE fails with "cannot be restored over
+        # the existing ...". REPLACE makes the operation idempotent.
         $sql = if ($moveClause -eq "") {
-            "RESTORE DATABASE [$db] FROM DISK = '$bakPath'"
+            "RESTORE DATABASE [$db] FROM DISK = '$bakPath' WITH REPLACE"
         } else {
             $moveClause = $moveClause.TrimEnd(", ")
-            "RESTORE DATABASE [$db] FROM DISK = '$bakPath' WITH $moveClause"
+            "RESTORE DATABASE [$db] FROM DISK = '$bakPath' WITH REPLACE, $moveClause"
         }
 
         $restoreOut = sqlcmd -S $sqlInstance -U sa -P $saPassword -C -Q $sql 2>&1

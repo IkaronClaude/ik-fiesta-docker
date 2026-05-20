@@ -27,7 +27,17 @@ $publicIp      = $env:PUBLIC_IP
 $sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.0.1' }
 $sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' }
 $saPassword    = $env:SA_PASSWORD
-$odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'ODBC Driver 17 for SQL Server' }
+$odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'SQL Server' }
+
+# IS_ZONE / CRYPT_BLOB_PATH: when set, start.ps1 launches an in-process
+# HTTP listener on 127.0.0.1:58492 serving the operator-mounted GamigoZR
+# crypt blob. Eliminates the need for a separate gamigozr container --
+# each zone serves its own via loopback, which is what Zone.exe expects.
+# Without container-level host networking on Windows containers, a
+# separate gamigozr container can't be reached at 127.0.0.1 anyway.
+$isZoneRaw       = $env:IS_ZONE                                         # explicit override
+$cryptBlobPath   = if ($env:CRYPT_BLOB_PATH) { $env:CRYPT_BLOB_PATH }
+                   else                      { 'C:\gamigozr\response.txt' }
 
 # Accept FIESTA_EXE from env var OR first positional arg.
 if (-not $fiestaExe -and $args.Count -ge 1) {
@@ -88,6 +98,25 @@ if (-not $env:SERVICE_NAME) {
     $serviceName = $env:SERVICE_NAME
 }
 
+# --- Decide whether this container should host an in-process GamigoZR ---
+# Zones need a /GR.php-on-127.0.0.1:58492 HTTP response from GamigoZR; on
+# Linux host networking a sibling gamigozr container provides it, but
+# Windows containers can't share loopback so each Zone hosts its own.
+# IS_ZONE env var: "1"/"0"/"auto". `auto` -> Zone.exe (the binary) triggers.
+$isZone = $false
+switch (($isZoneRaw, 'auto')[[int]([string]::IsNullOrEmpty($isZoneRaw))]) {
+    '1'    { $isZone = $true }
+    '0'    { $isZone = $false }
+    'auto' { $isZone = ($processExe -ieq 'Zone.exe') }
+    default {
+        Write-Warning "Unknown IS_ZONE='$isZoneRaw', treating as auto"
+        $isZone = ($processExe -ieq 'Zone.exe')
+    }
+}
+if ((-not $isZone) -and $env:CRYPT_BLOB_PATH) {
+    Write-Warning "CRYPT_BLOB_PATH is set but IS_ZONE is false; GamigoZR stub will not start. The blob mount is only meaningful for Zone containers."
+}
+
 # --- Auto-seed per-container ServerInfo overlay ---
 # See start.sh for the full rationale; the short version is that each
 # container needs a writable per-container copy of 9Data\ServerInfo so
@@ -101,12 +130,23 @@ if (-not $env:SERVICE_NAME) {
 # SERVERINFO_SEED_DIR.
 $serverInfoSeedDir = if ($env:SERVERINFO_SEED_DIR) { $env:SERVERINFO_SEED_DIR } else { 'C:\source\9Data\ServerInfo' }
 $overlayDir        = Join-Path $fiestaPath '9Data\ServerInfo'
+# Re-seed on EVERY start, not just when empty. Why: ServerInfo.txt's
+# SERVER_INFO rows have docker hostnames in the IP column (e.g.
+# "worldmanager"). start.ps1's rewrite resolves them to container IPs
+# and writes the IPs back into the overlay. On a container restart,
+# docker can assign a new IP, but the overlay still has the OLD IP
+# from the previous run -- the exe then tries to bind an IP that
+# isn't its own and Listen_Add fails (WM "*FAILED Listen_Add"). Always
+# re-seeding from the source-of-truth hostname template guarantees the
+# rewrite step starts from a clean slate.
 if ((Test-Path $overlayDir -PathType Container) -and
-    -not (Get-ChildItem $overlayDir -Force -ErrorAction SilentlyContinue)) {
-    if (Test-Path $serverInfoSeedDir -PathType Container) {
-        Write-Host "Seeding $overlayDir <- $serverInfoSeedDir"
-        Copy-Item -Path (Join-Path $serverInfoSeedDir '*') -Destination $overlayDir -Recurse -Force
-    } else {
+    (Test-Path $serverInfoSeedDir -PathType Container)) {
+    Write-Host "Re-seeding $overlayDir <- $serverInfoSeedDir"
+    Get-ChildItem $overlayDir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Copy-Item -Path (Join-Path $serverInfoSeedDir '*') -Destination $overlayDir -Recurse -Force
+}
+elseif (Test-Path $overlayDir -PathType Container) {
+    if (-not (Get-ChildItem $overlayDir -Force -ErrorAction SilentlyContinue)) {
         Write-Warning "$overlayDir is empty and $serverInfoSeedDir is not mounted -- per-process config #include will fail."
     }
 }
@@ -141,7 +181,9 @@ function Get-IncludePaths {
     param([string]$cfgDir)
     $result = @{}
     if (-not (Test-Path $cfgDir)) { return @() }
-    Get-ChildItem -Path $cfgDir -Filter '*.txt' -File -ErrorAction SilentlyContinue | ForEach-Object {
+    # Recurse 3 levels: Zone processes nest their config under
+    # ZoneServerInfo/ZoneServerInfo.txt; flat services have it at the top.
+    Get-ChildItem -Path $cfgDir -Filter '*.txt' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {
         $txt = [System.IO.File]::ReadAllText($_.FullName)
         $matches = [regex]::Matches($txt, '(?m)^\s*#include\s+"([^"]+)"')
         foreach ($m in $matches) {
@@ -155,6 +197,27 @@ function Get-IncludePaths {
         }
     }
     return $result.Keys
+}
+
+# DNS-resolve whatever sits in the "IP" column of SERVER_INFO rows. If the
+# operator's source ServerInfo.txt has docker service names in the IP
+# column (e.g. "login", "worldmanager", "sqlserver", "zone01") instead of
+# 127.0.0.1, we resolve them to the actual container IP at startup. On
+# Linux host networking those names won't resolve and we leave the field
+# alone -- so the same source template works for both engines.
+function Resolve-HostnameOrNull {
+    param([string]$name)
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+    # Already an IP? leave it.
+    $ipOut = [ref] $null
+    if ([System.Net.IPAddress]::TryParse($name, $ipOut)) { return $null }
+    try {
+        $ip = [System.Net.Dns]::GetHostAddresses($name) |
+              Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+              Select-Object -First 1
+        if ($ip) { return $ip.IPAddressToString }
+    } catch { }
+    return $null
 }
 
 function Rewrite-ConfigFile {
@@ -174,15 +237,29 @@ function Rewrite-ConfigFile {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
 
-        if ($line -match '^\s*SERVER_INFO\s' -and $publicIp) {
-            # Only rewrite rows tagged ; PUBLIC_IP (client-facing).
-            if ($line -match ';.*PUBLIC_IP') {
-                if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"[^"]*)"([^"]+)"(.*)$') {
-                    $existing = $Matches[2]
-                    if ($existing -ne $publicIp) {
-                        $lines[$i] = '{0}"{1}"{2}' -f $Matches[1], $publicIp, $Matches[3]
-                        $changed = $true
-                    }
+        if ($line -match '^\s*SERVER_INFO\s') {
+            if ($line -match '^(\s*SERVER_INFO\s+"[^"]+"[^"]*)"([^"]+)"(.*)$') {
+                $prefix      = $Matches[1]
+                $existingVal = $Matches[2]
+                $suffix      = $Matches[3]
+                $newVal      = $existingVal
+
+                # If the IP column holds a hostname (not a literal IP),
+                # resolve it. Operator-templated names like "login" or
+                # "sqlserver" become the resolved container IP at runtime.
+                $resolved = Resolve-HostnameOrNull $existingVal
+                if ($resolved) { $newVal = $resolved }
+
+                # PUBLIC_IP-tagged rows: env-supplied PUBLIC_IP wins over
+                # whatever was there (used for the client-facing IP that
+                # external clients connect to).
+                if ($publicIp -and $line -match ';.*PUBLIC_IP') {
+                    $newVal = $publicIp
+                }
+
+                if ($newVal -ne $existingVal) {
+                    $lines[$i] = '{0}"{1}"{2}' -f $prefix, $newVal, $suffix
+                    $changed = $true
                 }
             }
         }
@@ -191,6 +268,12 @@ function Rewrite-ConfigFile {
             if ($newLine.Contains('SERVER=.\SQLEXPRESS')) {
                 $newLine = $newLine.Replace('SERVER=.\SQLEXPRESS', "SERVER=${sqlHost},${sqlPort}")
             }
+            # Also rewrite the literal SERVER=127.0.0.1,<port> pattern that
+            # ServerSource ships with -- when SQL_HOST is set to a sibling
+            # container's hostname (e.g. "sqlserver") this redirects ODBC at
+            # the SQL container instead of the loopback. ODBC Driver 17 does
+            # the hostname resolution natively, no IP substitution needed.
+            $newLine = [regex]::Replace($newLine, 'SERVER=127\.0\.0\.1,\d+', "SERVER=${sqlHost},${sqlPort}")
             if ($odbcDriver -ne 'SQL Server' -and $newLine.Contains('{SQL Server}')) {
                 $newLine = $newLine.Replace('{SQL Server}', "{$odbcDriver}")
             }
@@ -271,36 +354,50 @@ reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Natural  /d 126810443  /f | Out-Null
 reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Ocean    /d 7241589632 /f | Out-Null
 reg add 'HKLM\SOFTWARE\Wow6432Node\GBO' /v Sabana   /d 2554545953 /f | Out-Null
 
-# --- Step 2: Optionally start GamigoZR (anti-cheat) for Zone processes ---
-function Should-StartGamigoZR {
-    switch ($startGamigoZR) {
-        '1'    { return $true }
-        '0'    { return $false }
-        'auto' { return ($processExe -ieq 'Zone.exe') }
-        default {
-            Write-Warning "Unknown START_GAMIGOZR='$startGamigoZR', treating as auto"
-            return ($processExe -ieq 'Zone.exe')
-        }
-    }
-}
-
-if (Should-StartGamigoZR) {
-    $gamigoZRExe = Join-Path $fiestaPath (Join-Path $gamigoZRDir 'GamigoZR.exe')
-    if (Test-Path $gamigoZRExe) {
-        Write-Host "Registering GamigoZR service..."
-        sc.exe delete GamigoZR 2>$null | Out-Null
-        sc.exe create GamigoZR binPath= $gamigoZRExe start= demand | Out-Null
-        try {
-            Start-Service -Name GamigoZR -ErrorAction Stop
-            Write-Host "  GamigoZR started -> $gamigoZRExe"
-        }
-        catch {
-            Write-Warning "  GamigoZR failed to start: $_"
-        }
+# --- Step 2: In-container GamigoZR HTTP stub (zones only) ---
+# Real GamigoZR.exe is a 15 KB .NET service that listens on
+# 127.0.0.1:58492 and returns a static crypt blob for every request.
+# On Windows containers (no shared loopback) every Zone has to host
+# its own copy locally. PowerShell's HttpListener is the lightest way
+# to do that without baking extra packages into the image.
+#
+# Operator mounts the BYO crypt blob at $env:CRYPT_BLOB_PATH (default
+# C:\gamigozr\response.txt). The blob is extracted one-shot from real
+# GamigoZR via `curl http://127.0.0.1:58492/ > response.txt`.
+#
+# IS_ZONE=auto picks Zone.exe automatically. START_GAMIGOZR was the
+# previous Wine-on-Linux real-GamigoZR launcher knob and is unrelated
+# to this stub -- it's intentionally NOT consulted here.
+if ($isZone) {
+    if (Test-Path $cryptBlobPath -PathType Leaf) {
+        Write-Host "Starting GamigoZR stub on 127.0.0.1:58492 (blob: $cryptBlobPath)..."
+        $gamigozrJob = Start-Job -Name 'gamigozr-stub' -ScriptBlock {
+            param($blobPath)
+            $blob = [System.IO.File]::ReadAllBytes($blobPath)
+            $listener = [System.Net.HttpListener]::new()
+            $listener.Prefixes.Add('http://127.0.0.1:58492/')
+            $listener.Start()
+            try {
+                while ($listener.IsListening) {
+                    $ctx = $listener.GetContext()
+                    try {
+                        $ctx.Response.StatusCode    = 200
+                        $ctx.Response.ContentLength64 = $blob.Length
+                        $ctx.Response.OutputStream.Write($blob, 0, $blob.Length)
+                    } finally {
+                        $ctx.Response.Close()
+                    }
+                }
+            } finally {
+                $listener.Stop()
+            }
+        } -ArgumentList $cryptBlobPath
+        Write-Host "  GamigoZR stub job: $($gamigozrJob.Id)"
     }
     else {
-        Write-Warning "GamigoZR.exe not found at $gamigoZRExe"
-        Write-Host   "  Set START_GAMIGOZR=0 to skip, or GAMIGOZR_DIR=<your-dir> to override."
+        Write-Warning "IS_ZONE=true but CRYPT_BLOB_PATH ($cryptBlobPath) not found."
+        Write-Host   "  Mount your operator-extracted blob there (curl http://127.0.0.1:58492/ from a"
+        Write-Host   "  real GamigoZR.exe run, save the body). Without this, Zone will crash at HTML/Pass."
     }
 }
 

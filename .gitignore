@@ -8,6 +8,7 @@ HANDOVER.md
 
 # Operator-extracted GamigoZR crypt blob (BYO; do not commit)
 gamigozr-response.txt
+gamigozr-blob/
 
 # Example stack runtime state
 example/serverinfo/
