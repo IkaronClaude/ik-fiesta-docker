@@ -17,7 +17,22 @@
 #
 # See deploy/runtime/README.md for the full interface.
 
-FROM mcr.microsoft.com/windows/servercore:ltsc2022
+# --- Stage 1: build the s2s proxy ---
+# fiesta-proxy is a git submodule (lib/fiesta-proxy). Publishing the proxy
+# here keeps the runtime image self-contained: no host-mount, no separate
+# image pull at deploy time.
+FROM mcr.microsoft.com/dotnet/sdk:10.0-windowsservercore-ltsc2022 AS proxy-build
+WORKDIR C:/src
+COPY lib/fiesta-proxy/FiestaProxy.sln ./
+COPY lib/fiesta-proxy/src/ src/
+COPY lib/fiesta-proxy/lib/ lib/
+RUN dotnet publish src/FiestaProxy/FiestaProxy.csproj -c Release -o C:/proxy /p:UseAppHost=false
+
+# --- Stage 2: runtime image ---
+# Use the dotnet runtime base so `dotnet FiestaProxy.dll` works without
+# installing the runtime separately. Server Core ltsc2022 underneath so all
+# the VC++/ODBC steps work as before.
+FROM mcr.microsoft.com/dotnet/runtime:10.0-windowsservercore-ltsc2022
 
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
 
@@ -35,6 +50,11 @@ RUN Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2266337' \
       -ArgumentList '/i', 'C:/msodbcsql.msi', '/quiet', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES' \
       -Wait ; \
     Remove-Item C:/msodbcsql.msi
+
+# Co-located s2s proxy. start.ps1 launches this at boot with S2S_ROUTES
+# derived from the ServerInfo rewrite. Override S2S_PROXY_DLL to point
+# elsewhere if you mount a newer build over this path.
+COPY --from=proxy-build C:/proxy/ C:/fiesta-proxy/
 
 COPY start.ps1 C:/start.ps1
 

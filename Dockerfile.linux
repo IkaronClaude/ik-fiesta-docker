@@ -13,11 +13,24 @@
 #
 # See deploy/runtime/README.md for the full interface.
 
+# --- Stage 1: build the s2s proxy ---
+# fiesta-proxy is a git submodule (lib/fiesta-proxy).
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS proxy-build
+WORKDIR /src
+COPY lib/fiesta-proxy/FiestaProxy.sln ./
+COPY lib/fiesta-proxy/src/ src/
+COPY lib/fiesta-proxy/lib/ lib/
+RUN dotnet publish src/FiestaProxy/FiestaProxy.csproj -c Release -o /proxy /p:UseAppHost=false
+
+# --- Stage 2: runtime image ---
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 32-bit architecture support (Fiesta server exes are 32-bit Windows binaries).
+# Also pull in the .NET 10 runtime so start.sh can launch FiestaProxy.dll
+# (s2s proxy) as a co-process. We use the Microsoft apt repo because Ubuntu's
+# packaged 'dotnet' is older than what FiestaProxy targets.
 RUN dpkg --add-architecture i386 \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -63,6 +76,14 @@ RUN Xvfb :99 -screen 0 800x600x24 -nolisten tcp & \
     WINEDEBUG=-all wine reg add 'HKCU\Software\Wine\DllOverrides' \
         /v odbc32 /t REG_SZ /d builtin /f 2>/dev/null; \
     pkill Xvfb 2>/dev/null; true
+
+# Pull the .NET 10 runtime in from the official runtime image — same version
+# we built FiestaProxy with, ~120MB vs ~700MB if we copied from the SDK.
+COPY --from=mcr.microsoft.com/dotnet/runtime:10.0-noble /usr/share/dotnet /usr/share/dotnet
+RUN ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet
+
+# Co-located s2s proxy.
+COPY --from=proxy-build /proxy/ /opt/fiesta-proxy/
 
 COPY start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh

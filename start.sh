@@ -350,29 +350,37 @@ rewrite_config_file() {
                     ext_port="${!var_name:-}"
                     if [ -n "${ext_port}" ]; then new_port="${ext_port}"; fi
                 elif [ "${is_own}" -eq 1 ] && [ "${is_public}" -ne 1 ]; then
-                    # Own s2s row: rewrite to 127.0.0.1 + an internal port
-                    # (port + S2S_INTERNAL_OFFSET). The exe binds the
-                    # internal port on loopback; the s2s proxy binds
-                    # 0.0.0.0:original and forwards into us.
+                    # Own s2s row: bind 0.0.0.0 on the ORIGINAL port. The exe
+                    # listens here; the s2s proxy publishes a *shifted* port
+                    # externally (port + offset) and forwards into 127.0.0.1
+                    # on the original port. We deliberately do NOT shift the
+                    # exe's bind: Fiesta WM refuses 127.0.0.1 for SERVER_ID_
+                    # ZONE (idKind=6) even though it accepts 127.0.0.1 for
+                    # SERVER_ID_OPTOOL (idKind=8). Binding 0.0.0.0 sidesteps
+                    # the check; the exe's port stays internal to the pod
+                    # because we don't publish it (only the proxy's shifted
+                    # port is exposed).
                     if [ "${S2S_PROXY_DISABLED}" != "1" ]; then
-                        internal_port=$(( row_port + S2S_INTERNAL_OFFSET ))
-                        new_ip="127.0.0.1"
-                        new_port="${internal_port}"
-                        S2S_INBOUND_LINES+="0.0.0.0:${row_port}:127.0.0.1:${internal_port}"$'\n'
+                        external_port=$(( row_port + S2S_INTERNAL_OFFSET ))
+                        new_ip="0.0.0.0"
+                        S2S_INBOUND_LINES+="0.0.0.0:${external_port}:127.0.0.1:${row_port}"$'\n'
                     else
                         new_ip="0.0.0.0"
                     fi
                 else
-                    # Peer s2s row. Under s2s-proxy mode, point at 127.0.0.1
-                    # so the exe dials our local proxy; the proxy fans out
-                    # to the actual peer pod via DNS (resolved fresh per
-                    # connect inside the proxy).
+                    # Peer s2s row. Exe dials 127.0.0.1:port (local proxy
+                    # outbound listener); proxy tunnels to peer pod's
+                    # shifted external port (peer-dns:port+offset).
                     if [ "${S2S_PROXY_DISABLED}" != "1" ]; then
                         new_ip="127.0.0.1"
                         var_name="INTERNAL_HOST_${svc_name}"
                         int_host="${!var_name:-}"
                         upstream_host="${int_host:-${ip_field}}"
-                        S2S_OUTBOUND_LINES+="127.0.0.1:${row_port}:${upstream_host}:${row_port}"$'\n'
+                        # Skip outbound routes targeting loopback.
+                        if [[ ! "${upstream_host}" =~ ^(127\.|::1$|0\.0\.0\.0$) ]]; then
+                            upstream_port=$(( row_port + S2S_INTERNAL_OFFSET ))
+                            S2S_OUTBOUND_LINES+="127.0.0.1:${row_port}:${upstream_host}:${upstream_port}"$'\n'
+                        fi
                     else
                         var_name="INTERNAL_HOST_${svc_name}"
                         int_host="${!var_name:-}"

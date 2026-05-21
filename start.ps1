@@ -347,36 +347,50 @@ function Rewrite-ConfigFile {
                     if ($extPort)        { $newPort = $extPort }
                 }
                 elseif ($isOwn -and -not $isPublic) {
-                    # Own s2s row: rewrite to 127.0.0.1 + an internal port
-                    # (port + $s2sInternalOffset). The exe binds the internal
-                    # port on loopback; the s2s proxy binds 0.0.0.0:original
-                    # and forwards into us. Track the mapping so we can hand
-                    # it to the proxy as an inbound S2S_ROUTES entry.
+                    # Own s2s row: bind 0.0.0.0 on the ORIGINAL port. The exe
+                    # listens here; the s2s proxy publishes a *shifted* port
+                    # externally (port + offset) and forwards into 127.0.0.1
+                    # on the original port. We deliberately do NOT shift the
+                    # exe's bind: Fiesta WM refuses to bind 127.0.0.1 for
+                    # SERVER_ID_ZONE (idKind=6) even though it accepts
+                    # 127.0.0.1 for SERVER_ID_OPTOOL (idKind=8); apparently
+                    # the zone-listener path has a "loopback isn't a real
+                    # interface" check baked in. Binding 0.0.0.0 sidesteps
+                    # the check, and the proxy-on-shifted-port keeps the
+                    # exe's port internal to the pod (we don't publish it).
                     if (-not $s2sProxyDisabled) {
-                        $internalPort = [int]$existingPort + $s2sInternalOffset
-                        $newIp   = '127.0.0.1'
-                        $newPort = "$internalPort"
-                        $key     = "0.0.0.0:$existingPort"
-                        $script:s2sInbound[$key] = "0.0.0.0:${existingPort}:127.0.0.1:${internalPort}"
+                        $externalPort = [int]$existingPort + $s2sInternalOffset
+                        $newIp = '0.0.0.0'
+                        $key   = "0.0.0.0:$externalPort"
+                        $script:s2sInbound[$key] = "0.0.0.0:${externalPort}:127.0.0.1:${existingPort}"
                     }
                     else {
-                        # Legacy: bind 0.0.0.0, listen directly. WM's
-                        # source-IP whitelist will reject any non-loopback
-                        # peer in this mode.
                         $newIp = '0.0.0.0'
                     }
                 }
                 else {
                     # Peer s2s row (other service, LOCALHOST tag). Under
                     # s2s-proxy mode, point at 127.0.0.1 so the exe dials
-                    # our local proxy; the proxy fans out to the actual
-                    # peer pod via DNS (resolved fresh per connect).
+                    # our local proxy; the proxy tunnels to the peer pod's
+                    # *shifted* external port (peer-dns:port+offset), where
+                    # that pod's own s2s proxy is listening. The peer pod's
+                    # proxy then forwards into the peer exe's loopback.
                     if (-not $s2sProxyDisabled) {
                         $newIp = '127.0.0.1'
                         $intHost = [Environment]::GetEnvironmentVariable("INTERNAL_HOST_${svcName}")
                         $upstreamHost = if ($intHost) { $intHost } else { $existingIp }
-                        $key = "127.0.0.1:${existingPort}:${upstreamHost}"
-                        $script:s2sOutbound[$key] = "127.0.0.1:${existingPort}:${upstreamHost}:${existingPort}"
+                        # Skip outbound routes that target loopback. Operators
+                        # use INTERNAL_HOST_<svc>=127.0.0.1 to stub absent
+                        # peers; tunneling the proxy to itself either self-
+                        # loops or wastes capacity. The exe still has the
+                        # row pointed at 127.0.0.1 so its connect will fail
+                        # fast (connection refused on a port nothing listens
+                        # on) — matches "peer not deployed" semantics.
+                        if ($upstreamHost -notmatch '^(127\.|::1$|0\.0\.0\.0$)') {
+                            $upstreamPort = [int]$existingPort + $s2sInternalOffset
+                            $key = "127.0.0.1:${existingPort}:${upstreamHost}"
+                            $script:s2sOutbound[$key] = "127.0.0.1:${existingPort}:${upstreamHost}:${upstreamPort}"
+                        }
                     }
                     else {
                         # Legacy path: resolve docker service hostname to a

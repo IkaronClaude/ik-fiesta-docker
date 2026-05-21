@@ -1,0 +1,3 @@
+[submodule "lib/fiesta-proxy"]
+	path = lib/fiesta-proxy
+	url = file:///c/Projects/fiesta-proxy
