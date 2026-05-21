@@ -28,6 +28,26 @@ set -eo pipefail
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
 
+# --- S2S proxy mode ---
+# Co-locates a FiestaProxy.dll (s2s mode) in the same container as the exe.
+# All s2s peers become 127.0.0.1 from the exe's POV; the proxy fans out to
+# the actual peer pods. Eliminates the boot-time DNS race (proxy resolves
+# fresh per connect) and makes Fiesta's strict source-IP whitelist trivial
+# (incoming peers always appear as 127.0.0.1, which matches the configured
+# value). See fiesta-proxy/README.md for the proxy contract.
+: "${S2S_PROXY_DISABLED:=0}"
+: "${S2S_INTERNAL_OFFSET:=10000}"
+: "${S2S_PROXY_DLL:=/opt/fiesta-proxy/FiestaProxy.dll}"
+# Operator-supplied override for the per-process ServerInfo discovery path.
+# Auto-discovery is brittle: different exes bake different config layouts.
+: "${FIESTA_SERVERINFO_PATH:=}"
+
+# Accumulators populated during rewrite_config_file. One entry per s2s row.
+# (Bash doesn't have associative arrays in older versions, use newline-
+# delimited string with sort -u dedupe at the end.)
+S2S_INBOUND_LINES=""
+S2S_OUTBOUND_LINES=""
+
 # Accept FIESTA_EXE from env var OR first positional arg.
 if [ -z "${FIESTA_EXE:-}" ] && [ -n "${1:-}" ]; then
     FIESTA_EXE="$1"
@@ -258,38 +278,19 @@ fiesta_service_name() {
 }
 
 resolve_hostname_or_empty() {
-    # Echo a resolved IPv4 if the arg is a hostname that resolves to one,
-    # else echo empty. If the arg is already an IPv4, also echo empty
-    # (caller can detect "no rewrite needed").
-    #
-    # Retries with a short timeout. Reason: WM and Zone each rewrite their
-    # ServerInfo at startup with sibling hostnames -> IPs, and WM string-
-    # compares the configured "IP" against the incoming peer's source address.
-    # If the rewrite runs while a peer is still scheduling (docker DNS not yet
-    # registered for it), the fallback to literal hostname leaves WM rejecting
-    # the peer's later connection. Docker DNS usually settles in <2s so this
-    # loop converges fast. TODO: replace with fixed container IPs on a static
-    # network OR an s2s-aware proxy that lets binaries dial logical names.
+    # Single-shot DNS. No retry loop -- under s2s-proxy mode the proxy
+    # resolves peer DNS fresh per outbound connect, so any startup-time
+    # docker-DNS race is invisible to the exe. The old retry-loop fix
+    # for "WM rejects by literal IP" is obsolete: every peer appears as
+    # 127.0.0.1 to the exe in s2s-proxy mode.
     local name="$1"
-    local timeout_seconds="${2:-30}"
     [ -z "$name" ] && return 0
     if [[ "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         return 0
     fi
-    local deadline=$(( $(date +%s) + timeout_seconds ))
-    local attempt=0
-    local ip=""
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        attempt=$((attempt + 1))
-        ip=$(getent hosts "$name" 2>/dev/null | awk '{print $1; exit}')
-        if [ -n "$ip" ]; then
-            [ "$attempt" -gt 1 ] && echo "  resolved $name -> $ip after $attempt attempts" >&2
-            echo "$ip"
-            return 0
-        fi
-        sleep 0.5
-    done
-    echo "  WARN: $name did not resolve within ${timeout_seconds}s; falling back to literal" >&2
+    local ip
+    ip=$(getent hosts "$name" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$ip" ] && echo "$ip"
 }
 
 rewrite_config_file() {
@@ -348,16 +349,38 @@ rewrite_config_file() {
                     var_name="EXTERNAL_PORT_${svc_name}"
                     ext_port="${!var_name:-}"
                     if [ -n "${ext_port}" ]; then new_port="${ext_port}"; fi
+                elif [ "${is_own}" -eq 1 ] && [ "${is_public}" -ne 1 ]; then
+                    # Own s2s row: rewrite to 127.0.0.1 + an internal port
+                    # (port + S2S_INTERNAL_OFFSET). The exe binds the
+                    # internal port on loopback; the s2s proxy binds
+                    # 0.0.0.0:original and forwards into us.
+                    if [ "${S2S_PROXY_DISABLED}" != "1" ]; then
+                        internal_port=$(( row_port + S2S_INTERNAL_OFFSET ))
+                        new_ip="127.0.0.1"
+                        new_port="${internal_port}"
+                        S2S_INBOUND_LINES+="0.0.0.0:${row_port}:127.0.0.1:${internal_port}"$'\n'
+                    else
+                        new_ip="0.0.0.0"
+                    fi
                 else
-                    # LOCALHOST-tagged (s2s/OPTOOL). Prefer per-service
-                    # INTERNAL_HOST env (docker service name); fall back
-                    # to the source row's hostname. Resolve via DNS.
-                    var_name="INTERNAL_HOST_${svc_name}"
-                    int_host="${!var_name:-}"
-                    host_to_resolve="${int_host:-${ip_field}}"
-                    resolved="$(resolve_hostname_or_empty "${host_to_resolve}")"
-                    if [ -n "${resolved}" ]; then new_ip="${resolved}"
-                    elif [ -n "${int_host}" ]; then new_ip="${int_host}"
+                    # Peer s2s row. Under s2s-proxy mode, point at 127.0.0.1
+                    # so the exe dials our local proxy; the proxy fans out
+                    # to the actual peer pod via DNS (resolved fresh per
+                    # connect inside the proxy).
+                    if [ "${S2S_PROXY_DISABLED}" != "1" ]; then
+                        new_ip="127.0.0.1"
+                        var_name="INTERNAL_HOST_${svc_name}"
+                        int_host="${!var_name:-}"
+                        upstream_host="${int_host:-${ip_field}}"
+                        S2S_OUTBOUND_LINES+="127.0.0.1:${row_port}:${upstream_host}:${row_port}"$'\n'
+                    else
+                        var_name="INTERNAL_HOST_${svc_name}"
+                        int_host="${!var_name:-}"
+                        host_to_resolve="${int_host:-${ip_field}}"
+                        resolved="$(resolve_hostname_or_empty "${host_to_resolve}")"
+                        if [ -n "${resolved}" ]; then new_ip="${resolved}"
+                        elif [ -n "${int_host}" ]; then new_ip="${int_host}"
+                        fi
                     fi
                 fi
 
@@ -423,19 +446,56 @@ if [ -z "${PUBLIC_IP:-}" ]; then
     exit 1
 fi
 
-echo "Walking config includes from ${PROCESS_DIR}..."
-INCLUDES="$(collect_includes "${PROCESS_DIR}")"
-if [ -n "${INCLUDES}" ]; then
-    while IFS= read -r inc; do
-        [ -z "${inc}" ] && continue
-        if [ ! -f "${inc}" ]; then
-            echo "  WARN: included file not found: ${inc}"
-            continue
-        fi
-        rewrite_config_file "${inc}" || true
-    done <<< "${INCLUDES}"
+if [ -n "${FIESTA_SERVERINFO_PATH}" ]; then
+    echo "Using FIESTA_SERVERINFO_PATH override: ${FIESTA_SERVERINFO_PATH}"
+    if [ -f "${FIESTA_SERVERINFO_PATH}" ]; then
+        rewrite_config_file "${FIESTA_SERVERINFO_PATH}" || true
+    else
+        echo "  WARN: FIESTA_SERVERINFO_PATH not found"
+    fi
 else
-    echo "  (no #include directives found in ${PROCESS_DIR}/*.txt)"
+    echo "Walking config includes from ${PROCESS_DIR}..."
+    INCLUDES="$(collect_includes "${PROCESS_DIR}")"
+    if [ -n "${INCLUDES}" ]; then
+        while IFS= read -r inc; do
+            [ -z "${inc}" ] && continue
+            if [ ! -f "${inc}" ]; then
+                echo "  WARN: included file not found: ${inc}"
+                continue
+            fi
+            rewrite_config_file "${inc}" || true
+        done <<< "${INCLUDES}"
+    else
+        echo "  (no #include directives found in ${PROCESS_DIR}/*.txt)"
+    fi
+fi
+
+# --- Launch co-located s2s proxy ---
+# The exe was rewritten to bind 127.0.0.1:<port+offset> for each own s2s row
+# and to dial 127.0.0.1:<original-port> for each peer s2s row. The proxy
+# materialises those:
+#   inbound:  bind 0.0.0.0:<original> -> 127.0.0.1:<port+offset>   (peer -> us)
+#   outbound: bind 127.0.0.1:<port>   -> <peer-dns>:<port>          (us -> peer)
+# DNS resolves fresh per outbound connect inside FiestaProxy, so peer-pod
+# IP churn doesn't require a restart.
+if [ "${S2S_PROXY_DISABLED}" != "1" ]; then
+    ALL_ROUTES="$(printf '%s%s' "${S2S_INBOUND_LINES}" "${S2S_OUTBOUND_LINES}" | sort -u | grep -v '^$' || true)"
+    if [ -n "${ALL_ROUTES}" ]; then
+        if [ ! -f "${S2S_PROXY_DLL}" ]; then
+            echo "ERROR: s2s proxy DLL not found at ${S2S_PROXY_DLL}."
+            echo "  Set S2S_PROXY_DLL or set S2S_PROXY_DISABLED=1 to opt out"
+            echo "  (peer auth will fail in that case)."
+            exit 1
+        fi
+        export S2S_ROUTES="$(printf '%s' "${ALL_ROUTES}" | paste -sd ';' -)"
+        echo "Launching s2s proxy: ${S2S_PROXY_DLL}"
+        echo "  S2S_ROUTES = ${S2S_ROUTES}"
+        dotnet "${S2S_PROXY_DLL}" &
+        S2S_PROXY_PID=$!
+        echo "  s2s proxy pid: ${S2S_PROXY_PID}"
+    else
+        echo "No s2s rows in ServerInfo -- no proxy needed for this service."
+    fi
 fi
 
 # Wine maps Z:\ to / -- translate the exe path to its Windows-style form.

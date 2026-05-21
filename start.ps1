@@ -29,6 +29,28 @@ $sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' 
 $saPassword    = $env:SA_PASSWORD
 $odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'SQL Server' }
 
+# --- S2S proxy mode ---
+# Co-locates a FiestaProxy.dll (s2s mode) in the same container as the exe.
+# All s2s peers become 127.0.0.1 from the exe's POV; the proxy fans out to
+# the actual peer pods. Eliminates the boot-time DNS race (proxy resolves
+# fresh per connect) and makes Fiesta's strict source-IP whitelist trivial
+# (incoming peers always appear as 127.0.0.1, which matches the configured
+# value). See fiesta-proxy/README.md for the proxy contract.
+$s2sProxyDisabled  = $env:S2S_PROXY_DISABLED -eq '1'
+$s2sInternalOffset = if ($env:S2S_INTERNAL_OFFSET) { [int]$env:S2S_INTERNAL_OFFSET } else { 10000 }
+$s2sProxyDll       = if ($env:S2S_PROXY_DLL)       { $env:S2S_PROXY_DLL }
+                     else                          { 'C:\fiesta-proxy\FiestaProxy.dll' }
+
+# Operator-supplied override for the per-process ServerInfo discovery path.
+# Auto-discovery is brittle: different exes bake different config layouts.
+# When set, this path is used verbatim instead of walking $processDir.
+$serverInfoOverride = $env:FIESTA_SERVERINFO_PATH
+
+# Accumulators populated during Rewrite-ConfigFile and consumed when we
+# launch the proxy below.
+$script:s2sInbound  = @{}   # key "0.0.0.0:port" -> "0.0.0.0:port:127.0.0.1:internalPort"
+$script:s2sOutbound = @{}   # key "127.0.0.1:port:host" -> "127.0.0.1:port:host:port"
+
 # Fiesta hardcodes a type->service-name mapping in its exes. We mirror
 # it here so per-service overrides can be declared as env vars keyed
 # by that name (with world/zone suffixes when the service is per-world
@@ -255,37 +277,21 @@ function Get-IncludePaths {
 # Linux host networking those names won't resolve and we leave the field
 # alone -- so the same source template works for both engines.
 function Resolve-HostnameOrNull {
-    param(
-        [string]$name,
-        [int]$timeoutSeconds = 30
-    )
-    # Retry-resolve with timeout. Reason: WM and Zone each rewrite their
-    # ServerInfo at startup with sibling hostnames -> IPs, and WM string-compares
-    # the configured "IP" against the incoming peer's source address. If the
-    # rewrite runs while a peer is still scheduling (docker DNS not yet
-    # registered for it), the fallback to literal hostname leaves WM rejecting
-    # the peer's later connection. Docker DNS usually settles in <2s so this
-    # loop converges fast. TODO: replace with fixed container IPs on a static
-    # network OR an s2s-aware proxy that lets binaries dial logical names.
+    param([string]$name)
+    # Single-shot DNS resolution. No retry loop — under s2s-proxy mode the
+    # proxy resolves peer DNS fresh per outbound connect, so any startup
+    # race in docker DNS is invisible to the exe. The old retry-loop fix
+    # for "WM rejects by literal IP" is obsolete: under s2s-proxy mode every
+    # peer appears to the exe as 127.0.0.1 anyway.
     if ([string]::IsNullOrWhiteSpace($name)) { return $null }
     $ipOut = [ref] $null
     if ([System.Net.IPAddress]::TryParse($name, $ipOut)) { return $null }
-    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
-    $attempt = 0
-    while ((Get-Date) -lt $deadline) {
-        $attempt++
-        try {
-            $ip = [System.Net.Dns]::GetHostAddresses($name) |
-                  Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
-                  Select-Object -First 1
-            if ($ip) {
-                if ($attempt -gt 1) { Write-Host "  resolved $name -> $($ip.IPAddressToString) after $attempt attempts" }
-                return $ip.IPAddressToString
-            }
-        } catch { }
-        Start-Sleep -Milliseconds 500
-    }
-    Write-Host "  WARN: $name did not resolve within ${timeoutSeconds}s; falling back to literal"
+    try {
+        $ip = [System.Net.Dns]::GetHostAddresses($name) |
+              Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+              Select-Object -First 1
+        if ($ip) { return $ip.IPAddressToString }
+    } catch { }
     return $null
 }
 
@@ -340,16 +346,47 @@ function Rewrite-ConfigFile {
                     $extPort = [Environment]::GetEnvironmentVariable("EXTERNAL_PORT_${svcName}")
                     if ($extPort)        { $newPort = $extPort }
                 }
+                elseif ($isOwn -and -not $isPublic) {
+                    # Own s2s row: rewrite to 127.0.0.1 + an internal port
+                    # (port + $s2sInternalOffset). The exe binds the internal
+                    # port on loopback; the s2s proxy binds 0.0.0.0:original
+                    # and forwards into us. Track the mapping so we can hand
+                    # it to the proxy as an inbound S2S_ROUTES entry.
+                    if (-not $s2sProxyDisabled) {
+                        $internalPort = [int]$existingPort + $s2sInternalOffset
+                        $newIp   = '127.0.0.1'
+                        $newPort = "$internalPort"
+                        $key     = "0.0.0.0:$existingPort"
+                        $script:s2sInbound[$key] = "0.0.0.0:${existingPort}:127.0.0.1:${internalPort}"
+                    }
+                    else {
+                        # Legacy: bind 0.0.0.0, listen directly. WM's
+                        # source-IP whitelist will reject any non-loopback
+                        # peer in this mode.
+                        $newIp = '0.0.0.0'
+                    }
+                }
                 else {
-                    # LOCALHOST-tagged rows (s2s/OPTOOL). Prefer per-service
-                    # INTERNAL_HOST env (docker service name); fall back to
-                    # the source row's hostname. Resolve via DNS to the
-                    # sibling container's current IP. Port stays internal.
-                    $intHost = [Environment]::GetEnvironmentVariable("INTERNAL_HOST_${svcName}")
-                    $hostToResolve = if ($intHost) { $intHost } else { $existingIp }
-                    $resolved = Resolve-HostnameOrNull $hostToResolve
-                    if ($resolved)  { $newIp = $resolved }
-                    elseif ($intHost) { $newIp = $intHost }
+                    # Peer s2s row (other service, LOCALHOST tag). Under
+                    # s2s-proxy mode, point at 127.0.0.1 so the exe dials
+                    # our local proxy; the proxy fans out to the actual
+                    # peer pod via DNS (resolved fresh per connect).
+                    if (-not $s2sProxyDisabled) {
+                        $newIp = '127.0.0.1'
+                        $intHost = [Environment]::GetEnvironmentVariable("INTERNAL_HOST_${svcName}")
+                        $upstreamHost = if ($intHost) { $intHost } else { $existingIp }
+                        $key = "127.0.0.1:${existingPort}:${upstreamHost}"
+                        $script:s2sOutbound[$key] = "127.0.0.1:${existingPort}:${upstreamHost}:${existingPort}"
+                    }
+                    else {
+                        # Legacy path: resolve docker service hostname to a
+                        # sibling container's current IP at boot.
+                        $intHost = [Environment]::GetEnvironmentVariable("INTERNAL_HOST_${svcName}")
+                        $hostToResolve = if ($intHost) { $intHost } else { $existingIp }
+                        $resolved = Resolve-HostnameOrNull $hostToResolve
+                        if ($resolved)  { $newIp = $resolved }
+                        elseif ($intHost) { $newIp = $intHost }
+                    }
                 }
 
                 if ($newIp -ne $existingIp -or $newPort -ne $existingPort) {
@@ -412,14 +449,51 @@ if (-not $publicIp) {
 }
 
 
-Write-Host "Walking config includes from $processDir..."
-$includes = @(Get-IncludePaths -cfgDir $processDir)
-if ($includes.Count -gt 0) {
-    foreach ($inc in $includes) {
-        Rewrite-ConfigFile -file $inc
+if ($serverInfoOverride) {
+    Write-Host "Using FIESTA_SERVERINFO_PATH override: $serverInfoOverride"
+    if (Test-Path $serverInfoOverride -PathType Leaf) {
+        Rewrite-ConfigFile -file $serverInfoOverride
     }
-} else {
-    Write-Host "  (no #include directives found in $processDir\*.txt)"
+    else {
+        Write-Warning "FIESTA_SERVERINFO_PATH not found: $serverInfoOverride"
+    }
+}
+else {
+    Write-Host "Walking config includes from $processDir..."
+    $includes = @(Get-IncludePaths -cfgDir $processDir)
+    if ($includes.Count -gt 0) {
+        foreach ($inc in $includes) {
+            Rewrite-ConfigFile -file $inc
+        }
+    } else {
+        Write-Host "  (no #include directives found in $processDir\*.txt)"
+    }
+}
+
+# --- Step 2.5: launch co-located s2s proxy ---
+# The exe was rewritten to bind 127.0.0.1:<port+offset> for each own s2s row
+# and to dial 127.0.0.1:<original-port> for each peer s2s row. The proxy
+# materialises those:
+#   inbound:  bind 0.0.0.0:<original> -> 127.0.0.1:<port+offset>   (peer -> us)
+#   outbound: bind 127.0.0.1:<port>   -> <peer-dns>:<port>          (us -> peer)
+# DNS resolves fresh per outbound connect inside FiestaProxy, so peer-pod
+# IP churn doesn't require a restart.
+if (-not $s2sProxyDisabled) {
+    $allRoutes = @($script:s2sInbound.Values) + @($script:s2sOutbound.Values)
+    if ($allRoutes.Count -gt 0) {
+        if (-not (Test-Path $s2sProxyDll -PathType Leaf)) {
+            Write-Error "S2S proxy DLL not found at $s2sProxyDll. Set S2S_PROXY_DLL to its location, or set S2S_PROXY_DISABLED=1 to opt out (peer auth will fail in that case)."
+            exit 1
+        }
+        $env:S2S_ROUTES = $allRoutes -join ';'
+        Write-Host "Launching s2s proxy: $s2sProxyDll"
+        Write-Host "  S2S_ROUTES = $($env:S2S_ROUTES)"
+        $s2sProxyProc = Start-Process -FilePath 'dotnet' -ArgumentList @($s2sProxyDll) -PassThru -NoNewWindow
+        Write-Host "  s2s proxy pid: $($s2sProxyProc.Id)"
+    }
+    else {
+        Write-Host "No s2s rows in ServerInfo -- no proxy needed for this service."
+    }
 }
 
 # --- Step 1: Registry keys required by Fiesta exes ---
