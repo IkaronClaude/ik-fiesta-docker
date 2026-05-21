@@ -582,6 +582,40 @@ foreach ($pat in $logPatterns) {
         ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
+# --- Step 3.5: wait for SQL Server to be reachable ---
+# Reason: sqlserver's docker healthcheck passes once SELECT 1 works, but the
+# .bak auto-restore takes another ~30s after that. If a Fiesta exe boots
+# during that window its DB_Init blocks for ~14s on the ODBC connect
+# (driver default), then fails with "DB_Init FAILED" and the exe exits 0.
+# `restart: on-failure` then doesn't trigger (clean exit), so the container
+# silently sits dead while peer s2s storms hammer its proxy. Probe SQL
+# here, retry for up to SQL_WAIT_SECONDS (default 90s), so launching the
+# exe service only happens once the DB layer is actually serving.
+$sqlWait = if ($env:SQL_WAIT_SECONDS) { [int]$env:SQL_WAIT_SECONDS } else { 90 }
+if ($saPassword) {
+    Write-Host "Probing SQL connection $sqlHost,$sqlPort (timeout ${sqlWait}s)..."
+    $sqlDeadline = (Get-Date).AddSeconds($sqlWait)
+    $sqlReady = $false
+    $sqlCs = "DRIVER={SQL Server};SERVER=$sqlHost,$sqlPort;UID=sa;PWD=$saPassword"
+    while ((Get-Date) -lt $sqlDeadline) {
+        try {
+            $conn = New-Object System.Data.Odbc.OdbcConnection($sqlCs)
+            $conn.ConnectionTimeout = 3
+            $conn.Open()
+            $conn.Close()
+            $sqlReady = $true
+            break
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+    if ($sqlReady) {
+        Write-Host "  SQL ready."
+    } else {
+        Write-Warning "  SQL not reachable after ${sqlWait}s; launching anyway (exe will likely DB_Init-fail and exit)."
+    }
+}
+
 # --- Step 4: Register and start the Windows service ---
 # Running the exe directly would block on StartServiceCtrlDispatcher() -- register
 # with sc.exe and let SCM start it. cd to the process dir so any relative paths
