@@ -261,15 +261,35 @@ resolve_hostname_or_empty() {
     # Echo a resolved IPv4 if the arg is a hostname that resolves to one,
     # else echo empty. If the arg is already an IPv4, also echo empty
     # (caller can detect "no rewrite needed").
+    #
+    # Retries with a short timeout. Reason: WM and Zone each rewrite their
+    # ServerInfo at startup with sibling hostnames -> IPs, and WM string-
+    # compares the configured "IP" against the incoming peer's source address.
+    # If the rewrite runs while a peer is still scheduling (docker DNS not yet
+    # registered for it), the fallback to literal hostname leaves WM rejecting
+    # the peer's later connection. Docker DNS usually settles in <2s so this
+    # loop converges fast. TODO: replace with fixed container IPs on a static
+    # network OR an s2s-aware proxy that lets binaries dial logical names.
     local name="$1"
+    local timeout_seconds="${2:-30}"
     [ -z "$name" ] && return 0
     if [[ "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         return 0
     fi
-    # getent hosts emits "<ip> <name>" on success.
-    local ip
-    ip=$(getent hosts "$name" 2>/dev/null | awk '{print $1; exit}')
-    [ -n "$ip" ] && echo "$ip"
+    local deadline=$(( $(date +%s) + timeout_seconds ))
+    local attempt=0
+    local ip=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        attempt=$((attempt + 1))
+        ip=$(getent hosts "$name" 2>/dev/null | awk '{print $1; exit}')
+        if [ -n "$ip" ]; then
+            [ "$attempt" -gt 1 ] && echo "  resolved $name -> $ip after $attempt attempts" >&2
+            echo "$ip"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "  WARN: $name did not resolve within ${timeout_seconds}s; falling back to literal" >&2
 }
 
 rewrite_config_file() {

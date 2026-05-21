@@ -255,17 +255,37 @@ function Get-IncludePaths {
 # Linux host networking those names won't resolve and we leave the field
 # alone -- so the same source template works for both engines.
 function Resolve-HostnameOrNull {
-    param([string]$name)
+    param(
+        [string]$name,
+        [int]$timeoutSeconds = 30
+    )
+    # Retry-resolve with timeout. Reason: WM and Zone each rewrite their
+    # ServerInfo at startup with sibling hostnames -> IPs, and WM string-compares
+    # the configured "IP" against the incoming peer's source address. If the
+    # rewrite runs while a peer is still scheduling (docker DNS not yet
+    # registered for it), the fallback to literal hostname leaves WM rejecting
+    # the peer's later connection. Docker DNS usually settles in <2s so this
+    # loop converges fast. TODO: replace with fixed container IPs on a static
+    # network OR an s2s-aware proxy that lets binaries dial logical names.
     if ([string]::IsNullOrWhiteSpace($name)) { return $null }
-    # Already an IP? leave it.
     $ipOut = [ref] $null
     if ([System.Net.IPAddress]::TryParse($name, $ipOut)) { return $null }
-    try {
-        $ip = [System.Net.Dns]::GetHostAddresses($name) |
-              Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
-              Select-Object -First 1
-        if ($ip) { return $ip.IPAddressToString }
-    } catch { }
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    $attempt = 0
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        try {
+            $ip = [System.Net.Dns]::GetHostAddresses($name) |
+                  Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                  Select-Object -First 1
+            if ($ip) {
+                if ($attempt -gt 1) { Write-Host "  resolved $name -> $($ip.IPAddressToString) after $attempt attempts" }
+                return $ip.IPAddressToString
+            }
+        } catch { }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Host "  WARN: $name did not resolve within ${timeoutSeconds}s; falling back to literal"
     return $null
 }
 
