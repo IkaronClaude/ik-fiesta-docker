@@ -24,3 +24,6 @@ example/.env
 .idea/
 .DS_Store
 Thumbs.db
+check-users.sql
+insert-user.sql
+test-odbc-32.ps1
