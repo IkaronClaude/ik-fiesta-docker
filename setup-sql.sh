@@ -66,24 +66,33 @@ else
             echo "No *.bak files in ${BACKUP_DIR} -- nothing to restore."
         fi
 
+        # Why ATTACH-then-RESTORE instead of always-RESTORE: on a container
+        # recycle the data files on the volume survive but master may not
+        # (depends on whether the volume covers master's location). The old
+        # logic issued RESTORE WITH REPLACE against the surviving .mdf/.ldf,
+        # which CLOBBERED them with the .bak content and wiped every row the
+        # operator added at runtime. New logic re-ATTACHes existing files
+        # untouched; RESTORE only on genuine first boot. FORCE_RESTORE_DBS=1
+        # overrides (re-imports from .bak even if files exist).
+        FORCE_RESTORE="${FORCE_RESTORE_DBS:-0}"
+
         for BAK in "${BAKS[@]}"; do
             DB="$(basename "${BAK}")"
             DB="${DB%.*}"   # strip .bak / .BAK
 
-            # Skip if already registered (volume persisted from a previous run).
+            # Skip if already registered (multi-run idempotency within a boot).
             DB_COUNT=$("${SQLCMD}" -S localhost -U sa -P "${SA_PASSWORD}" -C -h -1 -W \
                 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name = N'${DB}'" \
                 2>/dev/null | tr -d '[:space:]')
 
             if [ "${DB_COUNT}" = "1" ]; then
-                echo "Database '${DB}' already exists -- skipping restore."
+                echo "Database '${DB}' already registered -- skipping."
                 continue
             fi
 
-            echo "Restoring '${DB}' from ${BAK}..."
-
-            # Build MOVE clause from FILELISTONLY so the logical names land in
-            # ${DATA_DIR}/<DB>.mdf (+ <DB>_log.ldf, plus suffixed extras).
+            # Map logical names -> on-disk paths from the .bak's file list.
+            # Used for both ATTACH (locate existing files) and RESTORE (MOVE).
+            EXPECTED_PATHS=()   # on-disk path per logical file, in order
             MOVE_CLAUSE=""
             DATA_IDX=0
             LOG_IDX=0
@@ -93,12 +102,16 @@ else
                 case "${type}" in
                     D)
                         SUFFIX=$( [ "${DATA_IDX}" -eq 0 ] && echo "" || echo "_${DATA_IDX}" )
-                        MOVE_CLAUSE+="MOVE '${logical_name}' TO '${DATA_DIR}/${DB}${SUFFIX}.mdf', "
+                        P="${DATA_DIR}/${DB}${SUFFIX}.mdf"
+                        EXPECTED_PATHS+=( "${P}" )
+                        MOVE_CLAUSE+="MOVE '${logical_name}' TO '${P}', "
                         DATA_IDX=$((DATA_IDX + 1))
                         ;;
                     L)
                         SUFFIX=$( [ "${LOG_IDX}" -eq 0 ] && echo "" || echo "_${LOG_IDX}" )
-                        MOVE_CLAUSE+="MOVE '${logical_name}' TO '${DATA_DIR}/${DB}${SUFFIX}_log.ldf', "
+                        P="${DATA_DIR}/${DB}${SUFFIX}_log.ldf"
+                        EXPECTED_PATHS+=( "${P}" )
+                        MOVE_CLAUSE+="MOVE '${logical_name}' TO '${P}', "
                         LOG_IDX=$((LOG_IDX + 1))
                         ;;
                 esac
@@ -107,10 +120,33 @@ else
 
             MOVE_CLAUSE="${MOVE_CLAUSE%, }"
 
+            # All data files already present?
+            ALL_PRESENT=1
+            [ "${#EXPECTED_PATHS[@]}" -eq 0 ] && ALL_PRESENT=0
+            for P in "${EXPECTED_PATHS[@]}"; do
+                [ -f "${P}" ] || ALL_PRESENT=0
+            done
+
+            if [ "${ALL_PRESENT}" -eq 1 ] && [ "${FORCE_RESTORE}" != "1" ]; then
+                ON_CLAUSE=""
+                for P in "${EXPECTED_PATHS[@]}"; do
+                    ON_CLAUSE+="(FILENAME = '${P}'), "
+                done
+                ON_CLAUSE="${ON_CLAUSE%, }"
+                echo "Attaching '${DB}' from existing data files..."
+                if "${SQLCMD}" -S localhost -U sa -P "${SA_PASSWORD}" -C \
+                    -Q "CREATE DATABASE [${DB}] ON ${ON_CLAUSE} FOR ATTACH"; then
+                    echo "Database '${DB}' attached."
+                    continue
+                fi
+                echo "WARN: attach failed for '${DB}' -- falling back to RESTORE (clobbers data files)."
+            fi
+
+            echo "Restoring '${DB}' from ${BAK}..."
             if [ -n "${MOVE_CLAUSE}" ]; then
-                RESTORE_SQL="RESTORE DATABASE [${DB}] FROM DISK = '${BAK}' WITH ${MOVE_CLAUSE}"
+                RESTORE_SQL="RESTORE DATABASE [${DB}] FROM DISK = '${BAK}' WITH REPLACE, ${MOVE_CLAUSE}"
             else
-                RESTORE_SQL="RESTORE DATABASE [${DB}] FROM DISK = '${BAK}'"
+                RESTORE_SQL="RESTORE DATABASE [${DB}] FROM DISK = '${BAK}' WITH REPLACE"
             fi
 
             if "${SQLCMD}" -S localhost -U sa -P "${SA_PASSWORD}" -C -Q "${RESTORE_SQL}"; then
