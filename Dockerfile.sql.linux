@@ -15,15 +15,13 @@
 #     -p 1433:1433 \
 #     ghcr.io/<you>/fiesta-sql-runtime:linux
 
-# Pinned to a specific CU, NOT the moving `2022-latest` tag. `2022-latest`
-# drifts on every rebuild (e.g. 16.0.4252.3 -> 16.0.4260.1), and the newer
-# SQLPAL build threw a worker-thread RETAIL ASSERT under memory pressure on
-# a Docker Desktop / WSL2 host where the pinned CU is stable. CU/GDR tags in
-# MCR are immutable; only `*-latest` moves. To intentionally bump: pick a
-# newer `2022-CU<N>[-GDR<n>]-ubuntu-22.04` tag, rebuild, and verify with
+# SQL Server 2025, pinned to a specific CU (NOT the moving `2025-latest`
+# tag, which drifts on every rebuild). Matches the Windows image's major
+# version (SQL 2025) so both arches of fiesta-sql-runtime are consistent.
+# CU/GDR tags in MCR are immutable; only `*-latest` moves. To bump: pick a
+# newer `2025-CU<N>[-GDR<n>]-ubuntu-22.04` tag, rebuild, and verify with
 # `SELECT SERVERPROPERTY('ProductVersion')` before publishing.
-# 2022-CU24-GDR2 == build 16.0.4252.3 (the verified-good build).
-FROM mcr.microsoft.com/mssql/server:2022-CU24-GDR2-ubuntu-22.04
+FROM mcr.microsoft.com/mssql/server:2025-CU5-GDR1-ubuntu-22.04
 
 USER root
 
