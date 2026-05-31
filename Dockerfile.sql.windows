@@ -17,14 +17,24 @@
 #     -p 1433:1433 `
 #     ghcr.io/<you>/fiesta-sql-runtime:windows
 
-FROM mcr.microsoft.com/windows/servercore:ltsc2022
+# Base pinned to a digest, NOT the moving `ltsc2022` tag (which gets monthly
+# servicing updates). Same reproducibility reasoning as Dockerfile.sql.linux's
+# CU pin. To bump: `docker pull mcr.microsoft.com/windows/servercore:ltsc2022`,
+# read the new digest, update here.
+# ltsc2022 @ 2026-05 servicing.
+FROM mcr.microsoft.com/windows/servercore:ltsc2022@sha256:86da395cfd2b35dbfc2e9d08719550c51b0570c394bff8f92622a19234766185
 
 SHELL ["powershell", "-Command", "$ErrorActionPreference = 'Stop';"]
 
-# Install SQL Server Express 2025 silently. The install-time SA password is
-# baked in here so the entrypoint always has *something* to log in with on
-# the first boot; the entrypoint will ALTER LOGIN it to the user's
-# SA_PASSWORD if they differ.
+# Install SQL Server Express via the SSEI bootstrapper. CAVEAT: the SSEI
+# downloads the LATEST Express media at build time -- currently SQL Server
+# 2025 -- so this is NOT version-pinned and is a different MAJOR version from
+# the Linux image (pinned to SQL 2022 CU24-GDR2). A 2022 .bak restores onto
+# 2025 fine (forward-compatible, one-way upgrade), but for true parity +
+# reproducibility this should install SQL 2022 Express from a fixed offline
+# installer URL (TODO -- needs a stable download.microsoft.com SQLEXPR link).
+# The install-time SA password is baked in so the entrypoint always has
+# something to log in with on first boot; it ALTER LOGINs to SA_PASSWORD.
 RUN Invoke-WebRequest -Uri 'https://download.microsoft.com/download/7ab8f535-7eb8-4b16-82eb-eca0fa2d38f3/SQL2025-SSEI-Expr.exe' \
       -OutFile C:/sql-express-setup.exe ; \
     Start-Process -FilePath C:/sql-express-setup.exe \
