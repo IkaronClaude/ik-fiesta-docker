@@ -1,263 +1,163 @@
-# `example/` — full Fiesta server stack
+# Run a Fiesta Online server
 
-Running on **Kubernetes**? See [`k8s/`](k8s/) — the same bridge+proxy
-topology as plain manifests (`kubectl apply -k example/k8s/`).
+Brings up the full stack — SQL + DB bridges + Login + WorldManager + 5 zones,
+fronted by one client-facing proxy. Images are prebuilt and multi-arch on
+Docker Hub, so **there's nothing to compile**. You bring the game files.
 
-The rest of this doc covers the **Docker Compose** path: two parallel
-compose files for the same 11-container stack:
+Pick one:
 
-| Path | Engine | Runtime |
-|------|--------|---------|
-| `windows/docker-compose.yml` | Docker Desktop in **Windows-containers** mode | native (`Server Core ltsc2022`) |
-| `linux/docker-compose.yml`   | Docker on Linux (or Docker Desktop Linux mode) | Wine (`Ubuntu 24.04` + `wine64`) |
+- **Docker Compose** (one host) → [Compose quick start](#compose-quick-start)
+- **Kubernetes** (a cluster) → [`k8s/`](k8s/) + [k8s quick start](#kubernetes-quick-start)
 
-Both bring up the same logical topology:
+---
 
-```
-                          host (publishes 9010, 9013, 9016, 9019, 9022, 9025, 9028)
-                                                  |
-                                              proxy  <-- rewrites WM/Zone endpoints to PUBLIC_IP
-                                                  |
-       login - worldmanager - zone00 .. zone04   <-- reached only on the internal docker bridge
-         |          |              |
-       account  accountlog     character  gamelog  <-- DB bridge processes
-         |          |              |          |
-                          sqlserver           <-- SQL Server 2022 Express, host bind-mount
-```
+## What you provide (BYO)
 
-The runtime image ships **no game files** — you mount your own `ServerSource`
-tree, GamigoZR crypt blob, and (optionally) XOR table at runtime.
+The images ship **no game files**. You supply:
 
-## Quickstart
+1. **A ServerSource tree** — the standard layout:
+   ```
+   ServerSource/
+   ├── 9Data/                    game data + configs
+   ├── Login/Login.exe   WorldManager/WorldManager.exe
+   ├── Account/  AccountLog/  Character/  GameLog/    (each *.exe)
+   ├── Zone00/Zone.exe … Zone04/Zone.exe
+   ├── GamigoZR/GamigoZR.exe
+   └── Databases/                your *.bak files (restored on first SQL boot)
+   ```
+2. **A GamigoZR crypt blob** (`response.txt`) — extract once from a real
+   GamigoZR (`curl http://127.0.0.1:58492/ > response.txt`; recipe in
+   `Dockerfile.gamigozr-stub`). Each zone serves it to clients.
+3. *(optional)* an **XOR table** — only used by the proxy to decrypt C→S
+   packets for logging; the proxy runs fine without it.
 
-### 1. Get the images — no build needed
+You also choose **`PUBLIC_IP`** — the address your players actually connect
+to (LAN IP, WAN/forwarded IP, or `127.0.0.1` for a local-only test).
 
-Both the `linux/` and `windows/` compose files default to **multi-arch**
-images on Docker Hub (one tag, both OSes — Docker pulls the right variant
-for your engine):
+---
 
-```
-ikaronclaude/fiesta-server-runtime:latest
-ikaronclaude/fiesta-sql-runtime:latest
-ikaronclaude/fiesta-proxy:latest
-```
-
-`docker compose up -d` pulls them automatically — skip to step 2.
-
-To build the images yourself instead (a custom change, air-gapped, etc.),
-see [`../README.md`](../README.md) "Building your own base images" and set
-`RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` in `.env` to your local tags.
-
-> **Windows-host build gotcha (only if you build locally):** if Docker
-> Desktop's experimental *Host networking* toggle is on, `docker build`
-> can't reach apt mirrors. Toggle it OFF to build, back ON to run.
-
-### 2. Bring your own (BYO) bits
-
-Three things you provide; none ship with the image.
-
-**Your ServerSource tree.** Anywhere on the host; an absolute path. Must
-look like:
-
-```
-ServerSource/
-|-- 9Data/
-|-- Account/Account.exe
-|-- AccountLog/AccountLog.exe
-|-- Character/Character.exe
-|-- GameLog/GameLog.exe
-|-- Login/Login.exe
-|-- WorldManager/WorldManager.exe
-|-- Zone00/Zone.exe ... Zone04/Zone.exe
-|-- GamigoZR/GamigoZR.exe
-\-- Databases/                           # .bak files restored on first SQL boot
-```
-
-**GamigoZR crypt blob (optional).** Each Zone container runs a tiny HTTP
-stub that serves a pre-extracted GamigoZR response. To get the blob:
-
-```powershell
-# Run real GamigoZR.exe once on any Windows host; then:
-curl http://127.0.0.1:58492/ > response.txt
-```
-
-Drop `response.txt` into `windows/gamigozr-blob/` (or `linux/gamigozr-blob/`).
-Without it Zones still come up but reject every player handshake.
-
-**XOR table (optional).** The proxy reads the client-to-server cipher table
-to decrypt C→S packets for logging. The proxy works without it — the only
-cost is that C→S log lines show ciphertext. To use one, drop your table
-file into `windows/xor/xor.hex` and set `XOR_TABLE_PATH=C:\xor\xor.hex` in
-your `.env`. Or pass the table inline via `XOR_TABLE_HEX=…`.
-
-### 3. Pick your platform and configure
-
-```powershell
-# Windows
-cd example\windows
-copy .env.example .env
-notepad .env
-```
+## Compose quick start
 
 ```bash
-# Linux
-cd example/linux
+cd example/linux          # or example/windows (Docker Desktop, Windows-containers mode)
 cp .env.example .env
-$EDITOR .env
 ```
 
-Fill in the three required values: `FIESTA_SERVER` (path to your
-ServerSource), `SA_PASSWORD`, `PUBLIC_IP`.
+Edit `.env` — three required values:
 
-### 4. Up
+```ini
+FIESTA_SERVER=/abs/path/to/ServerSource
+SA_PASSWORD=ChangeMe!Strong1
+PUBLIC_IP=127.0.0.1            # the IP your client connects to
+```
+
+Drop your `response.txt` into `gamigozr-blob/`, then:
 
 ```bash
 docker compose up -d
-docker compose ps
 docker compose logs -f login
 ```
 
-First boot takes a couple of minutes — `sqlserver` restores every `.bak`
-in `Databases/`, then the DB bridges connect, then `login` /
-`worldmanager` / `zone00..04` register their s2s peers via the
-marker-protocol health-gate, then the proxy starts accepting players.
+Point a Fiesta client at `PUBLIC_IP:9010`. That's it — the Linux example
+pulls `ikaronclaude/fiesta-*:latest`; the Windows example does too (multi-arch).
 
-Point a Fiesta client at `PUBLIC_IP:9010` and log in.
-
-### 5. Down
+Create a test account (raw **uppercase** MD5 — see pitfalls):
 
 ```bash
-docker compose down            # stops + removes containers; database is safe
-docker compose down -v         # also wipes named volumes (but we don't use any
-                               # for DB data — sql-data is a bind mount, so this
-                               # is still safe in this example)
-rm -rf sql-data                # this is the only way to delete the database
+docker compose exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa \
+  -P "$SA_PASSWORD" -C -d Account -Q \
+  "INSERT INTO tUser (sUserID,sUserPW,sUserName,sUserIP) VALUES \
+   ('testuser', UPPER(CONVERT(varchar(32), HASHBYTES('MD5','test123'), 2)), 'Test','127.0.0.1')"
 ```
 
-## Database persistence
+Down: `docker compose down` (data is safe — see [DB persistence](#database--sql-options)).
 
-DB files live in `./sql-data/` on the host (bind mount, not a named
-volume). This is intentional:
+---
 
-- `docker compose down`            → safe
-- `docker compose down -v`         → safe (we don't use named volumes)
-- `docker volume rm …`             → safe (nothing to rm)
-- `rm -rf ./sql-data`              → **this is the only way to nuke the DB**
+## Kubernetes quick start
 
-The `fiesta-sql-runtime` image's setup script `ATTACH`es existing files on
-recycle and only `RESTORE`s on genuine first boot, so `down`/`up` preserves
-characters even though SQL Express's own `master` DB doesn't survive
-container destruction. To force a fresh restore from your `.bak` files,
-delete `sql-data/` and bring the stack back up.
+Full detail in [`k8s/README.md`](k8s/README.md). Minimal path:
 
-## Using an external SQL Server (BYO-SQL)
-
-The bundled `sqlserver` container is one of three options. The runtime
-image's `ServerInfo.txt` rewrite picks between them by env-var presence,
-in this priority order:
-
-| Tier | Env to set | Effect |
-|------|-----------|--------|
-| 1 — full string | `SQL_CONNECTION_STRING` | Replaces the entire `DRIVER={...};SERVER=...;UID=...;PWD=...` field of every `ODBC_INFO` row. Only the per-row init query (`USE <db>; SET LOCK_TIMEOUT ...`) is preserved. Use this when you need driver flags the lower tiers don't expose. |
-| 2 — host + password | `SQL_HOST` (+ optional `SQL_PORT`, `SA_PASSWORD`) | Rewrites `SERVER=` and `PWD=` per row; leaves `DRIVER={...}` and everything else from your source `ServerInfo.txt` intact. |
-| 3 — bundled (default) | nothing | `SQL_HOST` falls through to the docker DNS name `sqlserver` and the `bundled-sql` compose profile brings up the auto-restore SQL container. |
-
-### Tier 1 — full ODBC string
-
-Use when the lower tiers can't express what your SQL Server needs (e.g.
-TLS, alternate driver, AAD auth):
-
-```ini
-COMPOSE_PROFILES=
-SQL_CONNECTION_STRING=DRIVER={ODBC Driver 17 for SQL Server};SERVER=mydb.database.windows.net,1433;UID=sa;PWD=YourPassword;Encrypt=yes;TrustServerCertificate=yes
+```bash
+# 1. Put ServerSource on one node (default /root/fiesta-files) and install
+#    nfs-common on every node:   apt-get install -y nfs-common
+# 2. Edit example/k8s/00-namespace-config.yaml (PUBLIC_IP, SA_PASSWORD)
+#        and example/k8s/10-nfs.yaml (data node name + its IP + hostPath)
+# 3. Create the GamigoZR blob configmap:
+kubectl create configmap gamigozr-blob -n fiesta --from-file=response.txt=./response.txt
+# 4. Apply, wait for SQL, scale the game tier up:
+kubectl apply -k example/k8s/
+kubectl -n fiesta wait --for=condition=ready pod -l app=mssql --timeout=300s
+kubectl scale -n fiesta -l tier=game deploy --replicas=1
 ```
 
-The driver name has to match what's installed inside the runtime image:
+Players connect to the `fiesta-proxy` LoadBalancer IP on `:9010`.
 
-- **Linux/Wine runtime** ships only `{SQL Server}` (the legacy in-box
-  driver bridged via FreeTDS). Driver 17 isn't there.
-- **Windows containers runtime** ships only `{SQL Server}` too — the
-  32-bit Fiesta exes can't load the x64-only Driver 17 MSI. If you need
-  Driver 17, rebuild the runtime image with `Dockerfile.windows`
-  extended to install the 32-bit MSI variant.
+---
 
-### Tier 2 — host + password
+## Configuration
 
-The lighter override. The runtime keeps your source ServerInfo's driver
-clause and only patches `SERVER=` and `PWD=`:
+| Setting | Where | Notes |
+|---------|-------|-------|
+| `PUBLIC_IP` | `.env` / `game-env` ConfigMap | Advertised to clients. Must be the address they actually reach the proxy on. |
+| `SA_PASSWORD` | `.env` / `fiesta-sql` Secret | Meet SQL's complexity policy (8+ chars, mixed). |
+| `RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` | compose `.env` | Override the Hub defaults to use locally-built tags. |
+| `PROXY_PACKET_LOG=1` | proxy env | Per-frame opcode trace. Off by default. |
 
-```ini
-COMPOSE_PROFILES=
-SQL_HOST=your.sql.server.host
-SQL_PORT=1433
-SA_PASSWORD=YourSqlServerPassword
-```
+### Database / SQL options
 
-### Tier 3 — bundled container (default)
+- **Bundled SQL** (default): the `sqlserver` service / `mssql` StatefulSet
+  auto-restores every `.bak` in `Databases/` on first boot, then `ATTACH`es
+  the existing files on later boots (so `down`/`up` keeps your characters).
+- **Persistence (compose):** Linux uses a **named volume** (`down -v` wipes
+  it — don't). Windows uses a host bind mount. To force a fresh re-import,
+  remove the volume/dir and bring the stack back up.
+- **External SQL:** set `SQL_HOST` (+ drop the `bundled-sql` compose profile /
+  delete `k8s/20-sql.yaml`), or set the full `SQL_CONNECTION_STRING`. You must
+  pre-restore the six DBs (Account, AccountLog, World00_Character,
+  World00_GameLog, StatisticsData, OperatorTool) yourself.
 
-```ini
-COMPOSE_PROFILES=bundled-sql
-SA_PASSWORD=YourBundledSqlPassword
-# SQL_HOST / SQL_PORT / SQL_CONNECTION_STRING all unset
-```
+---
 
-### One-time setup on an external SQL Server (tier 1 or 2)
+## Common pitfalls
 
-Before `docker compose up -d` with a non-bundled tier:
+Everything below is a real failure we hit and fixed — symptom → cause → fix.
 
-1. **Restore every `.bak` in `Databases/`** as a database with the
-   matching name. Stock ServerSource ships:
+### SQL Server
 
-    | .bak file              | Restored database name |
-    |------------------------|------------------------|
-    | `Account.bak`          | `Account`              |
-    | `AccountLog.bak`       | `AccountLog`           |
-    | `World00_Character.bak`| `World00_Character`    |
-    | `World00_GameLog.bak`  | `World00_GameLog`      |
-    | `StatisticsData.bak`   | `StatisticsData`       |
-    | `OperatorTool.bak`     | `OperatorTool`         |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Bridges log `DB_Init FAILED`; can't connect to SQL | The 32-bit Fiesta exes **can't load the x64-only ODBC Driver 17**. | Keep `ODBC_DRIVER={SQL Server}` (the legacy in-box driver — the image default). Don't "upgrade" it. |
+| `sqlservr` crashes in `sqlpal.dll` right after start (Docker Desktop) | SQL Server on Linux needs POSIX-strict storage; a **Windows-host bind mount over Docker Desktop's 9P bridge** doesn't provide it. | Use a **named volume** for `/var/opt/mssql` (the Linux example's default). Bind mounts only on a native Linux host. |
+| SQL worked, then a rebuild started crashing | The `mssql/server:2022-latest`/`2025-latest` tag is a **moving target**; a newer build regressed. | Pin to a specific CU tag (the Dockerfiles do: `…-CU…-ubuntu-22.04`). |
+| SQL container restart-loops on boot; logins rejected with error 18401 | SQL is in **script upgrade mode** (applying CU upgrade to the DBs) and rejects logins until done — the readiness probe killed it early. | Already handled: `setup-sql` detects upgrade mode and waits. Just give it time / a generous probe `failureThreshold`. |
+| Container shows `Running` but every login fails; DB seems dead | `sqlservr` was **OOM-killed inside the container** while PID 1 lived (so `OOMKilled=false` misleads). | Give SQL enough memory (≥2–3 GiB) and don't overcommit the node/host. |
 
-    The exact set comes from your `ODBC_INFO` rows in `ServerInfo.txt`.
-    Restore via `sqlcmd`, SSMS, or Azure Data Studio.
+### Login & accounts
 
-2. **Make sure the connecting account has read+write on all six DBs.**
-   The example assumes `sa`; if you use a non-sysadmin login, grant it
-   `db_owner` (or finer-grained writes) on each fiesta database.
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Client: *"please check id or password"* with correct creds | Either SQL is down (see above) **or** the stored password hash is wrong. | `tUser.sUserPW` is **raw MD5 hex, UPPERCASE**, no salt. Store the uppercase MD5 of the plaintext. |
+| Login screen shows the world but joining hangs | Proxy isn't rewriting the WM/Zone endpoint, or `PUBLIC_IP` is wrong. | Check proxy logs for the `WORLDSELECT_ACK [rewritten]` line; set `PUBLIC_IP` to the address the client actually uses. |
+| Zone screen black / client rejected on zone enter | Missing/incorrect GamigoZR crypt blob. | Put the real `response.txt` in `gamigozr-blob/` (compose) or the `gamigozr-blob` ConfigMap (k8s). |
+| `zone00` loads fully then exits cleanly, crash-loops (others fine) | The town zone asserts on **`SlotMachineJackPotRanking`** with corrupted slot-machine ranking data in the DB. | Nuke the DB volume and let it **restore fresh from `.bak`** (the bad data was runtime state, not in the backup). |
 
-3. **Network reachability.** From inside a runtime container, `SQL_HOST`
-   has to resolve and `SQL_PORT` has to be open. For Azure SQL that
-   means firewall-allowing the docker host's outbound IP; for an on-prem
-   box it usually Just Works because docker bridge networking NATs
-   through the host.
+### Kubernetes / resources
 
-`down -v` and `down` don't touch your external DB — that's its own
-lifecycle. The "Database persistence" rules above only apply to the
-bundled container.
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Game-pod PVC mount fails: `mount failed: exit status 32` | `nfs-common` (the `mount.nfs` helper) isn't installed on the node. | `apt-get install -y nfs-common` on **every** node that runs game pods. |
+| Pod crashes copying files: `cp: … Operation not supported` | `cp -a` can't preserve perms/xattrs over NFS, and aborts startup. | Fixed in the image (`cp -rL` fallback). Use a current image (`:latest` / `dev-3`+). |
+| A node — or the whole cluster/API — falls over when scaling zones | **Under-requested resources**: zones requested ~`100m`/`1Gi` but use ~`1.5 CPU`/`2.1 GiB`, so the scheduler overpacked one node until it OOM'd (worse if all zones are pinned to one node). | Request memory at **real usage** (`mem:2560Mi`, `cpu:1` floor); don't pin all zones to one node. Pods then spread, and over-capacity goes `Pending` (safe) instead of nuking a node. Each loaded zone ≈ 2.1 GiB — size nodes accordingly. |
+| `kubectl scale` keeps getting reverted | Argo/Flux re-syncs the git `replicas` value. | Set `ignoreDifferences` on `/spec/replicas` (+ `RespectIgnoreDifferences`), or change replicas in git. |
+| Removed manifests still running after a sync | GitOps `prune: false`. | Delete the orphaned resources manually (`kubectl delete`). |
 
-## Troubleshooting
+### Logs & build host
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `sqlserver` healthcheck never goes green | Wrong `SA_PASSWORD` (doesn't meet SQL Server's complexity policy) | 8+ chars, mixed classes; `docker compose logs sqlserver` shows the policy error |
-| `account`/`character` restart loop | DB bridges booted before SQL ready-marker | Should not happen with image-baked healthcheck; check `docker compose logs sqlserver` for restore errors |
-| `account` restart-loop on external SQL | DB not restored / wrong creds / firewall | Run `docker compose run --rm account sqlcmd -S $SQL_HOST -U sa -P $SA_PASSWORD -Q "SELECT name FROM sys.databases"` to verify the bridge can reach + authenticate; ensure all six DBs (Account, AccountLog, World00_Character, World00_GameLog, StatisticsData, OperatorTool) are present |
-| Login screen shows world but join hangs | Proxy isn't rewriting WM endpoint, or `PUBLIC_IP` wrong | `docker compose logs proxy` should show the `WORLDSELECT_ACK [rewritten]` line; set `PROXY_PACKET_LOG=1` for per-packet trace |
-| Client connects but Zone screen black | Missing/incorrect crypt blob | Drop `response.txt` into `gamigozr-blob/`; check `docker compose logs zone01` for HttpListener startup |
-| Want to see every packet | | `PROXY_PACKET_LOG=1` in `.env`, `docker compose restart proxy`, `docker compose logs -f proxy` |
-
-## Customising
-
-- **Different zone count.** Trim or extend the `zoneNN` services + the
-  matching `PROXY_ROUTES` entry. Each new zone needs an
-  `INTERNAL_HOST_Zone_0_N` line in `*fiesta-env` and, for any zone slot
-  you removed, an `INTERNAL_HOST_Zone_0_N=127.0.0.1` stub so start.ps1's
-  DNS-rewrite skips that row instead of waiting 30s per missing peer.
-  Stock `ServerInfo.txt` defines 5 zones; the example provisions all of them.
-- **Different SQL port.** Set `SQL_PORT=…` in `.env`; both the runtime's
-  ODBC rewrite and the bridge processes pick it up.
-- **Remap external ports.** Change the `ports:` lines on the `proxy`
-  service and set `EXTERNAL_PORT_<ServiceName>=<remapped>` for each one
-  you moved; the proxy rewrites announcement packets accordingly.
-- **Disable per-zone GamigoZR stub.** Set `START_GAMIGOZR=1` and remove the
-  `CRYPT_BLOB` mount — start.ps1 then launches the real `GamigoZR.exe`
-  service inside each Zone container.
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Old/duplicate log lines interleaved in container output (Linux) | The persisted ServerSource accumulates `Assert*/KQLog*/Message*` across runs; the tailer re-reads them from line 1. | Fixed in the image — `start.sh` cleans stale logs before launch. Use a current image. |
+| Wall of `Could not resolve keysym XF86…` warnings (Linux) | Harmless `xkbcomp` noise from Xvfb. | Fixed — Xvfb output is redirected to `/tmp/xvfb.log`. |
+| Hundreds of `s2s outbound accept/close` lines flooding logs | Per-connection s2s logging on by default. | Fixed — gated behind `PROXY_PACKET_LOG=1`. |
+| `docker build` hangs forever reaching apt mirrors (Docker Desktop) | The experimental **Host networking** toggle blocks the build network. | Toggle Host networking **off** to build, back on to run. |
+| Docker Desktop wedges (500s) during big builds | WSL2 VM out of memory/disk. | Give it headroom in `%USERPROFILE%\.wslconfig` (`memory`, `swap`); don't run other heavy stacks during a build. |
