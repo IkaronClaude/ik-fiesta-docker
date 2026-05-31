@@ -28,6 +28,12 @@ $sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.
 $sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' }
 $saPassword    = $env:SA_PASSWORD
 $odbcDriver    = if ($env:ODBC_DRIVER)    { $env:ODBC_DRIVER }    else { 'SQL Server' }
+# Full ODBC connection string override. When set, every ODBC_INFO row's
+# connection-string field is replaced wholesale — SQL_HOST / SQL_PORT /
+# SA_PASSWORD / ODBC_DRIVER are then ignored. The init query ("USE <db>;
+# SET LOCK_TIMEOUT ...") is preserved per row so each bridge still
+# targets the right database.
+$sqlConnectionString = $env:SQL_CONNECTION_STRING
 
 # --- S2S proxy mode ---
 # Co-locates a FiestaProxy.dll (s2s mode) in the same container as the exe.
@@ -50,6 +56,20 @@ $serverInfoOverride = $env:FIESTA_SERVERINFO_PATH
 # launch the proxy below.
 $script:s2sInbound  = @{}   # key "0.0.0.0:port" -> "0.0.0.0:port:127.0.0.1:internalPort"
 $script:s2sOutbound = @{}   # key "127.0.0.1:port:host" -> "127.0.0.1:port:host:port"
+
+# --- Co-process teardown ---
+# The container's lifecycle is anchored to the game exe (the service monitored
+# in Step 6). The s2s proxy process and the GamigoZR / log-tailer jobs are all
+# co-processes -- tear them down on exit so the container stops WITH its exe
+# and never lingers just because the proxy is still listening.
+$script:s2sProxyProc = $null
+function Invoke-Cleanup {
+    if ($script:s2sProxyProc -and -not $script:s2sProxyProc.HasExited) {
+        try { Stop-Process -Id $script:s2sProxyProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    try { Get-Job -ErrorAction SilentlyContinue | Stop-Job   -ErrorAction SilentlyContinue } catch {}
+    try { Get-Job -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+}
 
 # Fiesta hardcodes a type->service-name mapping in its exes. We mirror
 # it here so per-service overrides can be declared as env vars keyed
@@ -411,25 +431,39 @@ function Rewrite-ConfigFile {
         }
         elseif ($line -match 'ODBC_INFO') {
             $newLine = $line
-            if ($newLine.Contains('SERVER=.\SQLEXPRESS')) {
-                $newLine = $newLine.Replace('SERVER=.\SQLEXPRESS', "SERVER=${sqlHost},${sqlPort}")
+            if ($sqlConnectionString) {
+                # Full-string override path. Replace the connection-string
+                # field (the SECOND quoted string on the row — the first is
+                # the bridge name like "Account") wholesale, leaving the
+                # init query (third quoted field, with `USE <db>;`) intact.
+                if ($newLine -match '^(.*ODBC_INFO\s*"[^"]*"[^"]*)"([^"]+)"(.*)$') {
+                    $prefix = $Matches[1]; $oldConn = $Matches[2]; $suffix = $Matches[3]
+                    if ($oldConn -ne $sqlConnectionString) {
+                        $newLine = '{0}"{1}"{2}' -f $prefix, $sqlConnectionString, $suffix
+                    }
+                }
             }
-            # Also rewrite the literal SERVER=127.0.0.1,<port> pattern that
-            # ServerSource ships with -- when SQL_HOST is set to a sibling
-            # container's hostname (e.g. "sqlserver") this redirects ODBC at
-            # the SQL container instead of the loopback. ODBC Driver 17 does
-            # the hostname resolution natively, no IP substitution needed.
-            $newLine = [regex]::Replace($newLine, 'SERVER=127\.0\.0\.1,\d+', "SERVER=${sqlHost},${sqlPort}")
-            if ($odbcDriver -ne 'SQL Server' -and $newLine.Contains('{SQL Server}')) {
-                $newLine = $newLine.Replace('{SQL Server}', "{$odbcDriver}")
-            }
-            if ($saPassword -and $newLine -match '(PWD=)([^;"\s]+)') {
-                $existing = $Matches[2]
-                if ($existing -ne $saPassword) {
-                    # Literal replace on the matched substring -- avoids regex
-                    # injection from special chars in $saPassword.
-                    $matchedFull = $Matches[0]
-                    $newLine = $newLine.Replace($matchedFull, "PWD=$saPassword")
+            else {
+                if ($newLine.Contains('SERVER=.\SQLEXPRESS')) {
+                    $newLine = $newLine.Replace('SERVER=.\SQLEXPRESS', "SERVER=${sqlHost},${sqlPort}")
+                }
+                # Also rewrite the literal SERVER=127.0.0.1,<port> pattern that
+                # ServerSource ships with -- when SQL_HOST is set to a sibling
+                # container's hostname (e.g. "sqlserver") this redirects ODBC at
+                # the SQL container instead of the loopback. ODBC Driver 17 does
+                # the hostname resolution natively, no IP substitution needed.
+                $newLine = [regex]::Replace($newLine, 'SERVER=127\.0\.0\.1,\d+', "SERVER=${sqlHost},${sqlPort}")
+                if ($odbcDriver -ne 'SQL Server' -and $newLine.Contains('{SQL Server}')) {
+                    $newLine = $newLine.Replace('{SQL Server}', "{$odbcDriver}")
+                }
+                if ($saPassword -and $newLine -match '(PWD=)([^;"\s]+)') {
+                    $existing = $Matches[2]
+                    if ($existing -ne $saPassword) {
+                        # Literal replace on the matched substring -- avoids regex
+                        # injection from special chars in $saPassword.
+                        $matchedFull = $Matches[0]
+                        $newLine = $newLine.Replace($matchedFull, "PWD=$saPassword")
+                    }
                 }
             }
             if ($newLine -ne $line) {
@@ -502,8 +536,8 @@ if (-not $s2sProxyDisabled) {
         $env:S2S_ROUTES = $allRoutes -join ';'
         Write-Host "Launching s2s proxy: $s2sProxyDll"
         Write-Host "  S2S_ROUTES = $($env:S2S_ROUTES)"
-        $s2sProxyProc = Start-Process -FilePath 'dotnet' -ArgumentList @($s2sProxyDll) -PassThru -NoNewWindow
-        Write-Host "  s2s proxy pid: $($s2sProxyProc.Id)"
+        $script:s2sProxyProc = Start-Process -FilePath 'dotnet' -ArgumentList @($s2sProxyDll) -PassThru -NoNewWindow
+        Write-Host "  s2s proxy pid: $($script:s2sProxyProc.Id)"
     }
     else {
         Write-Host "No s2s rows in ServerInfo -- no proxy needed for this service."
@@ -596,18 +630,23 @@ if ($saPassword) {
     Write-Host "Probing SQL connection $sqlHost,$sqlPort (timeout ${sqlWait}s)..."
     $sqlDeadline = (Get-Date).AddSeconds($sqlWait)
     $sqlReady = $false
-    $sqlCs = "DRIVER={SQL Server};SERVER=$sqlHost,$sqlPort;UID=sa;PWD=$saPassword"
+    # Plain TCP reachability check -- driver-agnostic. The 32-bit Fiesta exes
+    # use the in-box {SQL Server} ODBC driver; this script runs under 64-bit
+    # PowerShell, so an ODBC probe here would need a separate 64-bit driver
+    # and could mismatch. A TCP connect sidesteps bitness entirely. The real
+    # "DB fully restored" gate is the SQL image HEALTHCHECK + compose depends_on.
     while ((Get-Date) -lt $sqlDeadline) {
+        $tcp = New-Object System.Net.Sockets.TcpClient
         try {
-            $conn = New-Object System.Data.Odbc.OdbcConnection($sqlCs)
-            $conn.ConnectionTimeout = 3
-            $conn.Open()
-            $conn.Close()
-            $sqlReady = $true
-            break
-        } catch {
-            Start-Sleep -Seconds 2
-        }
+            $iar = $tcp.BeginConnect($sqlHost, [int]$sqlPort, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne(3000) -and $tcp.Connected) {
+                $tcp.EndConnect($iar)
+                $sqlReady = $true
+            }
+        } catch { }
+        finally { $tcp.Dispose() }
+        if ($sqlReady) { break }
+        Start-Sleep -Seconds 2
     }
     if ($sqlReady) {
         Write-Host "  SQL ready."
@@ -640,6 +679,7 @@ if (-not $service) {
         Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
         while ($true) { Start-Sleep -Seconds 60 }
     }
+    Invoke-Cleanup
     exit 1
 }
 
@@ -681,6 +721,7 @@ if ($logFiles.Count -eq 0) {
         Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
         while ($true) { Start-Sleep -Seconds 60 }
     }
+    Invoke-Cleanup
     exit 1
 }
 
@@ -764,6 +805,7 @@ while ($true) {
             Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
             while ($true) { Start-Sleep -Seconds 60 }
         }
+        Invoke-Cleanup
         exit 1
     }
 

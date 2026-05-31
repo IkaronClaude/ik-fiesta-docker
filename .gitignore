@@ -8,11 +8,23 @@ HANDOVER.md
 
 # Operator-extracted GamigoZR crypt blob (BYO; do not commit)
 gamigozr-response.txt
-gamigozr-blob/
 
-# Example stack runtime state
-example/serverinfo/
-example/.env
+# Example stack runtime state. Contents of serverinfo / gamigozr-blob / xor /
+# sql-data are gitignored (operator's own data); the .gitkeep markers stay
+# tracked so the directories exist after `git clone` (Docker on Windows
+# rejects bind mounts whose source dir doesn't exist).
+example/*/serverinfo/*/*
+!example/*/serverinfo/*/.gitkeep
+example/*/.env
+example/*/sql-data/
+example/*/gamigozr-blob/*
+!example/*/gamigozr-blob/.gitkeep
+example/*/xor/*
+!example/*/xor/.gitkeep
+# Anchored to repo root so it does NOT shadow the example/*/gamigozr-blob/
+# .gitkeep negations above (an unanchored `gamigozr-blob/` matches that dir
+# anywhere, and git won't descend into an ignored dir to honour the negation).
+/gamigozr-blob/
 .env
 
 # Build artefacts

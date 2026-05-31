@@ -15,7 +15,15 @@
 #     -p 1433:1433 \
 #     ghcr.io/<you>/fiesta-sql-runtime:linux
 
-FROM mcr.microsoft.com/mssql/server:2022-latest
+# Pinned to a specific CU, NOT the moving `2022-latest` tag. `2022-latest`
+# drifts on every rebuild (e.g. 16.0.4252.3 -> 16.0.4260.1), and the newer
+# SQLPAL build threw a worker-thread RETAIL ASSERT under memory pressure on
+# a Docker Desktop / WSL2 host where the pinned CU is stable. CU/GDR tags in
+# MCR are immutable; only `*-latest` moves. To intentionally bump: pick a
+# newer `2022-CU<N>[-GDR<n>]-ubuntu-22.04` tag, rebuild, and verify with
+# `SELECT SERVERPROPERTY('ProductVersion')` before publishing.
+# 2022-CU24-GDR2 == build 16.0.4252.3 (the verified-good build).
+FROM mcr.microsoft.com/mssql/server:2022-CU24-GDR2-ubuntu-22.04
 
 USER root
 
@@ -24,9 +32,17 @@ USER root
 RUN mkdir -p /var/opt/mssql/backup
 
 COPY setup-sql.sh /usr/local/bin/setup-sql.sh
-RUN chmod +x /usr/local/bin/setup-sql.sh
+COPY healthcheck-sql.sh /usr/local/bin/healthcheck-sql.sh
+RUN chmod +x /usr/local/bin/setup-sql.sh /usr/local/bin/healthcheck-sql.sh
 
 EXPOSE 1433
+
+# Healthy only once setup-sql.sh has finished its restore/attach pass AND SQL
+# answers a query -- a bare SELECT 1 would report healthy before the .bak
+# restore completes, letting DB-bridge containers boot into a half-restored
+# server. start-period is generous because large .bak restores take a while.
+HEALTHCHECK --interval=10s --timeout=10s --start-period=120s --retries=15 \
+    CMD /usr/local/bin/healthcheck-sql.sh
 
 # --- Runtime interface ---
 # SA_PASSWORD     REQUIRED. sa user password. Enforced by the mssql base image.

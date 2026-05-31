@@ -27,6 +27,12 @@ if (-not (Test-Path $dataDir)) {
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 }
 
+# Clear any stale readiness marker (container-local path, but be defensive).
+# The docker HEALTHCHECK stays "unhealthy/starting" until this is re-created
+# below, once restores are done -- see healthcheck-sql.ps1.
+$readyMarker = 'C:\fiesta-sql-ready'
+Remove-Item $readyMarker -Force -ErrorAction SilentlyContinue
+
 Write-Host "Starting SQL Server Express..."
 Start-Service 'MSSQL$SQLEXPRESS'
 Start-Sleep -Seconds 5
@@ -34,26 +40,46 @@ Start-Sleep -Seconds 5
 Write-Host "Waiting for SQL Server to accept connections..."
 $connectPassword = $saPassword
 $ready = $false
-for ($i = 0; $i -lt 30; $i++) {
-    sqlcmd -S $sqlInstance -U sa -P $connectPassword -C -Q "SELECT 1" *> $null
+# Plain-startup budget in seconds. NOT applied while SQL is in script upgrade
+# mode (see below). Override with SQL_STARTUP_TIMEOUT.
+$startupTimeout = if ($env:SQL_STARTUP_TIMEOUT) { [int]$env:SQL_STARTUP_TIMEOUT } else { 120 }
+$elapsed = 0
+while ($true) {
+    $probe = (sqlcmd -S $sqlInstance -U sa -P $connectPassword -C -Q "SELECT 1" 2>&1 | Out-String)
     if ($LASTEXITCODE -eq 0) { $ready = $true; break }
 
     # After a couple failures, try the install password so we can ALTER LOGIN.
-    if ($i -eq 2 -and $connectPassword -ne $installPassword) {
-        sqlcmd -S $sqlInstance -U sa -P $installPassword -C -Q "SELECT 1" *> $null
+    if ($elapsed -ge 4 -and $connectPassword -ne $installPassword) {
+        $probe2 = (sqlcmd -S $sqlInstance -U sa -P $installPassword -C -Q "SELECT 1" 2>&1 | Out-String)
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Connected with install password -- will ALTER LOGIN to SA_PASSWORD."
             $connectPassword = $installPassword
             $ready = $true
             break
         }
+        $probe = $probe + $probe2
+    }
+
+    # Script upgrade mode: after a CU/GDR base bump (engine newer than the DBs
+    # on the volume), SQL Express runs upgrade scripts on master/msdb/model and
+    # the user DBs and rejects every login with error 18401 ("Server is in
+    # script upgrade mode...") until done -- can take many minutes. Exiting here
+    # restart-loops the container and corrupts the half-upgraded DBs, so when we
+    # see that signal we wait with NO timeout: the engine is alive, progressing.
+    if ($probe -match 'script upgrade mode|upgrade script|18401') {
+        Write-Host "SQL Server is in script upgrade mode (applying upgrade scripts); waiting -- timeout suspended ($elapsed s elapsed)..."
+        $elapsed = 0
+        Start-Sleep -Seconds 5
+        continue
+    }
+
+    $elapsed += 2
+    if ($elapsed -ge $startupTimeout) {
+        Write-Host "ERROR: SQL Server did not become ready after $startupTimeout s (not in upgrade mode)." -ForegroundColor Red
+        Write-Host "  Last probe output: $probe"
+        exit 1
     }
     Start-Sleep -Seconds 2
-}
-
-if (-not $ready) {
-    Write-Host "ERROR: SQL Server did not become ready after 30 retries." -ForegroundColor Red
-    exit 1
 }
 
 if ($connectPassword -ne $saPassword) {
@@ -202,6 +228,11 @@ else {
 }
 
 Write-Host "SQL Server setup complete."
+
+# Signal readiness to the docker HEALTHCHECK: restores/attaches are done and
+# the server is fully serving. Until this exists the healthcheck fails, so
+# `depends_on: condition: service_healthy` holds the DB-bridge containers.
+New-Item -ItemType File -Path $readyMarker -Force | Out-Null
 
 # Keep the container alive by tailing the ERRORLOG. SQL 2022 = MSSQL16,
 # 2025 = MSSQL17 -- discover whichever exists.

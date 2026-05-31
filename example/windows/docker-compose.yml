@@ -1,0 +1,325 @@
+# Fiesta Online server stack -- Windows containers, bridge networking,
+# packet-rewriting proxy.
+#
+# What this brings up (11 containers):
+#   sqlserver                            -- SQL Server 2022 Express
+#   account, accountlog, character, gamelog   -- DB bridge processes
+#   login, worldmanager                  -- master services
+#   zone00 .. zone04                     -- the five stock zones
+#   proxy                                -- client-facing rewriter +
+#                                            the only container that
+#                                            publishes ports to the host
+#
+# Players connect to PUBLIC_IP:9010 (Login). The proxy rewrites the WM /
+# Zone endpoints inside WORLDSELECT_ACK / CHAR_LOGIN_ACK so the client is
+# steered back to the proxy for everything; the runtime containers stay
+# on the internal bridge network reachable only by docker DNS.
+#
+# Prereqs:
+#   * Docker Desktop in Windows-containers mode.
+#   * Built images: fiesta-server-runtime:latest, fiesta-sql-runtime:latest,
+#     fiesta-proxy:latest. See ../README.md "Build" for the commands.
+#   * .env next to this file (copy .env.example).
+#   * Your ServerSource tree pointed to by FIESTA_SERVER in .env.
+#   * (Optional) GamigoZR crypt blob at ./gamigozr-blob/response.txt.
+#   * (Optional) XOR table at ./xor/xor.hex (or XOR_TABLE_HEX in .env).
+#
+# Then:
+#   docker compose up -d
+#   docker compose logs -f login
+
+x-fiesta-env: &fiesta-env
+  # SQL access has three tiers, evaluated in order:
+  #   1. SQL_CONNECTION_STRING set -> the runtime drops it verbatim into every
+  #      ODBC_INFO row (only the USE-clause init query is preserved). Use
+  #      this for full ODBC tuning (Encrypt=, TrustServerCertificate=, etc.).
+  #   2. SQL_HOST set explicitly  -> server+password rewrite against your
+  #      external SQL Server, using the runtime image's default driver.
+  #   3. neither set              -> the bundled `sqlserver` service (default;
+  #      SQL_HOST falls through to the docker DNS name).
+  # See README.md "Using an external SQL Server (BYO-SQL)" for the recipes.
+  SA_PASSWORD: "${SA_PASSWORD:-}"
+  SQL_CONNECTION_STRING: "${SQL_CONNECTION_STRING:-}"
+  SQL_HOST: "${SQL_HOST:-sqlserver}"
+  SQL_PORT: "${SQL_PORT:-1433}"
+  PUBLIC_IP: "${PUBLIC_IP:?PUBLIC_IP not set. Copy .env.example to .env and edit.}"
+  KEEP_ALIVE: "${KEEP_ALIVE:-0}"
+  # Per-service docker DNS names for s2s. start.ps1 reads INTERNAL_HOST_<svc>
+  # for each LOCALHOST row in ServerInfo.txt and rewrites the IP to that
+  # docker service name. The baked-in fiesta-proxy then resolves the name
+  # fresh per s2s connection, so peer-pod IP churn doesn't need a restart.
+  INTERNAL_HOST_Login:           "login"
+  INTERNAL_HOST_WorldManager_0:  "worldmanager"
+  INTERNAL_HOST_Zone_0_0:        "zone00"
+  INTERNAL_HOST_Zone_0_1:        "zone01"
+  INTERNAL_HOST_Zone_0_2:        "zone02"
+  INTERNAL_HOST_Zone_0_3:        "zone03"
+  INTERNAL_HOST_Zone_0_4:        "zone04"
+  INTERNAL_HOST_Account:         "account"
+  INTERNAL_HOST_AccountLog:      "accountlog"
+  INTERNAL_HOST_Character_0:     "character"
+  INTERNAL_HOST_GameLog_0:       "gamelog"
+
+x-fiesta: &fiesta
+  # Image refs default to the local-build tags. To pull from a registry,
+  # set RUNTIME_IMAGE / SQL_IMAGE / PROXY_IMAGE in .env -- the example
+  # compose forwards each value to the matching service.
+  image: "${RUNTIME_IMAGE:-fiesta-server-runtime:latest}"
+  restart: on-failure
+
+services:
+  # Bundled SQL Server, gated behind the `bundled-sql` compose profile so the
+  # stack can be brought up against an external SQL Server instead. The
+  # default profile list in .env.example includes `bundled-sql`, so plain
+  # `docker compose up -d` brings it up. For external SQL: drop the profile
+  # in .env, set SQL_HOST in .env, and the bridges talk to your DB directly.
+  sqlserver:
+    image: "${SQL_IMAGE:-fiesta-sql-runtime:latest}"
+    profiles: ["bundled-sql"]
+    restart: on-failure
+    environment:
+      # Compose interpolates env vars on every service regardless of profile
+      # activation, so we can't make SA_PASSWORD mandatory here -- it'd
+      # break `docker compose up` for tier-1 / tier-2 operators who don't
+      # need it. The bundled SQL container itself will fail to start with a
+      # loud error if the operator forgets to set SA_PASSWORD AND keeps the
+      # `bundled-sql` profile active.
+      SA_PASSWORD: "${SA_PASSWORD:-}"
+    volumes:
+      # Host bind mount on purpose -- NOT a named volume. A named volume
+      # is wiped by `docker compose down -v`; a bind mount survives every
+      # compose verb and is only cleared by removing the host directory
+      # manually. See ../README.md "Database persistence".
+      - ${SQL_DATA_DIR:-./sql-data}:C:\sql-data
+      - ${FIESTA_SERVER:?FIESTA_SERVER not set. Copy .env.example to .env and edit.}/Databases:C:\backups:ro
+    # The image bakes a HEALTHCHECK (healthcheck-sql.ps1) that reports
+    # healthy only after the .bak restore/attach pass finishes; gate
+    # depends_on on that, otherwise bridges boot into a half-restored DB.
+
+  account:
+    <<: *fiesta
+    command: ["Account/Account.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/account:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      # required: false -> when the `bundled-sql` profile is disabled (i.e.
+      # operator points SQL_HOST at an external server), this dependency is
+      # silently skipped instead of blocking the bridge from starting.
+      sqlserver: { condition: service_healthy, required: false }
+
+  accountlog:
+    <<: *fiesta
+    command: ["AccountLog/AccountLog.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/accountlog:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      # required: false -> when the `bundled-sql` profile is disabled (i.e.
+      # operator points SQL_HOST at an external server), this dependency is
+      # silently skipped instead of blocking the bridge from starting.
+      sqlserver: { condition: service_healthy, required: false }
+
+  character:
+    <<: *fiesta
+    command: ["Character/Character.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/character:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      # required: false -> when the `bundled-sql` profile is disabled (i.e.
+      # operator points SQL_HOST at an external server), this dependency is
+      # silently skipped instead of blocking the bridge from starting.
+      sqlserver: { condition: service_healthy, required: false }
+
+  gamelog:
+    <<: *fiesta
+    command: ["GameLog/GameLog.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/gamelog:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      # required: false -> when the `bundled-sql` profile is disabled (i.e.
+      # operator points SQL_HOST at an external server), this dependency is
+      # silently skipped instead of blocking the bridge from starting.
+      sqlserver: { condition: service_healthy, required: false }
+
+  login:
+    <<: *fiesta
+    command: ["Login/Login.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/login:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      account:    { condition: service_started }
+      accountlog: { condition: service_started }
+      character:  { condition: service_started }
+      gamelog:    { condition: service_started }
+
+  worldmanager:
+    <<: *fiesta
+    command: ["WorldManager/WorldManager.exe"]
+    environment:
+      <<: *fiesta-env
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/worldmanager:C:\fiesta\9Data\ServerInfo
+    depends_on:
+      account:    { condition: service_started }
+      accountlog: { condition: service_started }
+      character:  { condition: service_started }
+      gamelog:    { condition: service_started }
+
+  # Each zone runs its own GamigoZR HTTP stub on 127.0.0.1:58492 inside the
+  # container (start.ps1 spins up a PowerShell HttpListener that serves the
+  # mounted crypt blob). Windows containers can't share loopback, so a
+  # per-zone stub is simpler than a separate service.
+  #
+  # Stock Fiesta ServerInfo binds zone PUBLIC ports at +3 per zone:
+  #   Zone_0_0=9016, Z_0_1=9019, Z_0_2=9022, Z_0_3=9025, Z_0_4=9028
+  # The exe reads the port from its own ServerInfo row; the proxy below
+  # publishes a host port for each one.
+
+  zone00:
+    <<: *fiesta
+    command: ["Zone00/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      IS_ZONE: "1"
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/zone00:C:\fiesta\9Data\ServerInfo
+      # CRYPT_BLOB selects WHICH host directory holds the GamigoZR crypt
+      # blob (response.txt). In-container path is fixed at C:\gamigozr\.
+      - ${CRYPT_BLOB:-./gamigozr-blob}:C:\gamigozr:ro
+    depends_on:
+      worldmanager: { condition: service_started }
+
+  zone01:
+    <<: *fiesta
+    command: ["Zone01/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      IS_ZONE: "1"
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/zone01:C:\fiesta\9Data\ServerInfo
+      - ${CRYPT_BLOB:-./gamigozr-blob}:C:\gamigozr:ro
+    depends_on:
+      worldmanager: { condition: service_started }
+
+  zone02:
+    <<: *fiesta
+    command: ["Zone02/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      IS_ZONE: "1"
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/zone02:C:\fiesta\9Data\ServerInfo
+      - ${CRYPT_BLOB:-./gamigozr-blob}:C:\gamigozr:ro
+    depends_on:
+      worldmanager: { condition: service_started }
+
+  zone03:
+    <<: *fiesta
+    command: ["Zone03/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      IS_ZONE: "1"
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/zone03:C:\fiesta\9Data\ServerInfo
+      - ${CRYPT_BLOB:-./gamigozr-blob}:C:\gamigozr:ro
+    depends_on:
+      worldmanager: { condition: service_started }
+
+  zone04:
+    <<: *fiesta
+    command: ["Zone04/Zone.exe"]
+    environment:
+      <<: *fiesta-env
+      IS_ZONE: "1"
+      START_GAMIGOZR: "0"
+    volumes:
+      - ${FIESTA_SERVER:?}:C:\fiesta
+      - ${FIESTA_SERVER:?}:C:\source:ro
+      - ./serverinfo/zone04:C:\fiesta\9Data\ServerInfo
+      - ${CRYPT_BLOB:-./gamigozr-blob}:C:\gamigozr:ro
+    depends_on:
+      worldmanager: { condition: service_started }
+
+  # Client-facing rewriting proxy. The ONLY container that publishes ports
+  # to the host. Players connect here; it rewrites the WM/Zone endpoints in
+  # WORLDSELECT_ACK / CHAR_LOGIN_ACK to point back at PUBLIC_IP (i.e. this
+  # proxy), then forwards to the game containers via docker DNS.
+  #
+  # The Login + WM routes are :rewrite (the proxy parses S->C frames and
+  # mutates IP/port fields). The Zone routes are :opaque -- the in-game
+  # channel is the noisiest connection in the stack and carries no address
+  # fields the proxy needs to touch, so it runs as a raw byte pump.
+  proxy:
+    image: "${PROXY_IMAGE:-fiesta-proxy:latest}"
+    restart: on-failure
+    environment:
+      PUBLIC_IP: "${PUBLIC_IP:?}"
+      PROXY_ROUTES: >-
+        9010:Login:login:9010;
+        9013:WorldManager_0:worldmanager:9013;
+        9016:Zone_0_0:zone00:9016:opaque;
+        9019:Zone_0_1:zone01:9019:opaque;
+        9022:Zone_0_2:zone02:9022:opaque;
+        9025:Zone_0_3:zone03:9025:opaque;
+        9028:Zone_0_4:zone04:9028:opaque
+      # XOR table (optional, BYO -- the proxy works without it, the only
+      # cost is that C->S packet logging shows ciphertext). XOR_TABLE_HEX
+      # wins if set; otherwise a file at XOR_TABLE_PATH inside the XOR_BLOB
+      # mount is loaded.
+      XOR_TABLE_HEX: "${XOR_TABLE_HEX:-}"
+      XOR_TABLE_PATH: "${XOR_TABLE_PATH:-}"
+      # Per-frame opcode trace. Off by default; set PROXY_PACKET_LOG=1 in
+      # .env to enable per-packet logging (connection-level logs stay on
+      # regardless).
+      PROXY_PACKET_LOG: "${PROXY_PACKET_LOG:-}"
+    ports:
+      - "9010:9010"   # Login
+      - "9013:9013"   # WorldManager_0
+      - "9016:9016"   # Zone_0_0
+      - "9019:9019"   # Zone_0_1
+      - "9022:9022"   # Zone_0_2
+      - "9025:9025"   # Zone_0_3
+      - "9028:9028"   # Zone_0_4
+    volumes:
+      - ${XOR_BLOB:-./xor}:C:\xor:ro
+    depends_on:
+      login:        { condition: service_started }
+      worldmanager: { condition: service_started }
+      zone00:       { condition: service_started }
+      zone01:       { condition: service_started }
+      zone02:       { condition: service_started }
+      zone03:       { condition: service_started }
+      zone04:       { condition: service_started }

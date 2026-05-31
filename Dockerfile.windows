@@ -71,8 +71,10 @@ COPY start.ps1 C:/start.ps1
 # SQL_HOST        SQL Server hostname for ODBC rewrites. Default: 127.0.0.1.
 # SQL_PORT        SQL Server port. Default: 1433.
 # SA_PASSWORD     Optional. If set, replaces PWD= values in ODBC_INFO rows.
-# ODBC_DRIVER     ODBC driver name inserted into DRIVER={...}. Default on Windows:
-#                 "ODBC Driver 17 for SQL Server" (installed in this image).
+# ODBC_DRIVER     ODBC driver name inserted into DRIVER={...}. Default "SQL Server",
+#                 the in-box legacy ODBC driver -- the only SQL driver usable by
+#                 the 32-bit Fiesta exes (the bundled msodbcsql MSI is x64-only,
+#                 unloadable from a 32-bit process).
 # START_GAMIGOZR  "auto" (start GamigoZR if the target exe is Zone.exe -- default),
 #                 "1" (always start), "0" (never start).
 # GAMIGOZR_DIR    Subdir under FIESTA_PATH containing GamigoZR.exe. Default: GamigoZR.

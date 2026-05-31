@@ -63,8 +63,16 @@ RUN New-Item -ItemType Directory -Path C:\backups -Force | Out-Null ; \
     New-Item -ItemType Directory -Path C:\sql-data -Force | Out-Null
 
 COPY setup-sql.ps1 C:/setup-sql.ps1
+COPY healthcheck-sql.ps1 C:/healthcheck-sql.ps1
 
 EXPOSE 1433
+
+# Healthy only once setup-sql.ps1 has finished its restore/attach pass AND SQL
+# answers a query -- a bare SELECT 1 would report healthy before the .bak
+# restore completes, letting DB-bridge containers boot into a half-restored
+# server. start-period is generous because large .bak restores take a while.
+HEALTHCHECK --interval=10s --timeout=10s --start-period=120s --retries=15 \
+    CMD powershell -NoProfile -ExecutionPolicy Bypass -File C:/healthcheck-sql.ps1
 
 # --- Runtime interface ---
 # SA_PASSWORD     REQUIRED. sa user password. ALTER LOGIN'd from the install

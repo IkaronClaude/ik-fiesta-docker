@@ -23,26 +23,61 @@ SQLCMD="/opt/mssql-tools18/bin/sqlcmd"
 # Make sure mssql user can read the bind-mounted backup files (host UIDs vary).
 chmod -R a+r "${BACKUP_DIR}" 2>/dev/null || true
 
+# Clear any stale readiness marker (container-local path, but be defensive).
+# The docker HEALTHCHECK stays "unhealthy/starting" until this is re-created
+# below, once restores are done -- see healthcheck-sql.sh.
+READY_MARKER="/tmp/fiesta-sql-ready"
+rm -f "${READY_MARKER}" 2>/dev/null || true
+
 echo "Starting SQL Server..."
 /opt/mssql/bin/sqlservr &
 SQL_PID=$!
 
 echo "Waiting for SQL Server to accept connections..."
+# Plain-startup budget. NOT applied while SQL is in script upgrade mode --
+# see below. Override with SQL_STARTUP_TIMEOUT (seconds).
+STARTUP_TIMEOUT="${SQL_STARTUP_TIMEOUT:-120}"
 SQL_READY=0
-for i in $(seq 1 60); do
-    if "${SQLCMD}" -S localhost -U sa -P "${SA_PASSWORD}" -C -Q "SELECT 1" > /dev/null 2>&1; then
-        echo "SQL Server is ready (${i}s)."
+elapsed=0
+while :; do
+    # If sqlservr itself died, stop waiting -- there's nothing to wait for and
+    # a fast exit lets `restart: on-failure` recycle the container.
+    if ! kill -0 "${SQL_PID}" 2>/dev/null; then
+        echo "ERROR: sqlservr exited during startup (pid ${SQL_PID} gone)."
+        exit 1
+    fi
+
+    # Probe; capture output so a failure can be classified.
+    if probe="$("${SQLCMD}" -S localhost -U sa -P "${SA_PASSWORD}" -C -Q "SELECT 1" 2>&1)"; then
+        echo "SQL Server is ready (${elapsed}s)."
         SQL_READY=1
         break
     fi
+
+    # Script upgrade mode: after a CU/GDR base-image bump (or any time the
+    # engine build is newer than the databases on the volume), SQL Server runs
+    # upgrade scripts against master/msdb/model and the user DBs on startup.
+    # While that runs it rejects EVERY login with error 18401 ("Server is in
+    # script upgrade mode. Only administrator can connect at this time.") and
+    # it can take many minutes. Killing it here corrupts the half-upgraded DBs
+    # and restart-loops forever. So when we see that signal we keep waiting
+    # with NO timeout -- the engine is alive and making progress.
+    if printf '%s' "${probe}" | grep -qiE "script upgrade mode|upgrade script|error.*18401|18401"; then
+        echo "SQL Server is in script upgrade mode (applying upgrade scripts); waiting -- timeout suspended (${elapsed}s elapsed)..."
+        elapsed=0
+        sleep 5
+        continue
+    fi
+
+    elapsed=$((elapsed + 1))
+    if [ "${elapsed}" -ge "${STARTUP_TIMEOUT}" ]; then
+        echo "ERROR: SQL Server did not become ready after ${STARTUP_TIMEOUT}s (not in upgrade mode)."
+        echo "  Last probe output: ${probe}"
+        kill "${SQL_PID}" 2>/dev/null || true
+        exit 1
+    fi
     sleep 1
 done
-
-if [ "${SQL_READY}" -ne 1 ]; then
-    echo "ERROR: SQL Server did not become ready after 60s."
-    kill "${SQL_PID}" 2>/dev/null || true
-    exit 1
-fi
 
 # Enable remote TCP (sqlservr listens on 0.0.0.0:1433 by default; this just
 # flips the legacy sp_configure flag some Fiesta exes still check).
@@ -159,6 +194,11 @@ else
 fi
 
 echo "SQL Server setup complete."
+
+# Signal readiness to the docker HEALTHCHECK: restores/attaches are done and
+# the server is fully serving. Until this exists the healthcheck fails, so
+# `depends_on: condition: service_healthy` holds the DB-bridge containers.
+touch "${READY_MARKER}"
 
 # Hand off to the foreground sqlservr.
 wait "${SQL_PID}"

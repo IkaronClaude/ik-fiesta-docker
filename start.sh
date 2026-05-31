@@ -27,6 +27,12 @@ set -eo pipefail
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
+# Full ODBC connection string override. When set, every ODBC_INFO row's
+# connection-string field is replaced wholesale -- SQL_HOST / SQL_PORT /
+# SA_PASSWORD / ODBC_DRIVER are then ignored. The init query
+# ("USE <db>; SET LOCK_TIMEOUT ...") is preserved per row so each bridge
+# still targets the right database.
+: "${SQL_CONNECTION_STRING:=}"
 
 # --- S2S proxy mode ---
 # Co-locates a FiestaProxy.dll (s2s mode) in the same container as the exe.
@@ -47,6 +53,25 @@ set -eo pipefail
 # delimited string with sort -u dedupe at the end.)
 S2S_INBOUND_LINES=""
 S2S_OUTBOUND_LINES=""
+
+# --- Co-process teardown ---
+# The container's lifecycle is anchored to the game exe (Step 6 waits on it).
+# The s2s proxy, GamigoZR nginx, Xvfb and the log tailer are all co-processes
+# that must die when this script does, so the container stops WITH its exe and
+# never lingers just because the proxy is still listening. trap-on-EXIT also
+# makes `docker stop` (SIGTERM) tear them down cleanly instead of leaving
+# orphans for docker to SIGKILL.
+cleanup() {
+    [ -n "${S2S_PROXY_PID:-}" ] && kill "${S2S_PROXY_PID}" 2>/dev/null || true
+    [ -n "${NGINX_PID:-}" ]     && kill "${NGINX_PID}"     2>/dev/null || true
+    [ -n "${TAIL_PID:-}" ]      && kill "${TAIL_PID}"      2>/dev/null || true
+    wineserver -k 2>/dev/null || true
+    # Catch-all for any remaining direct children (Xvfb, stray tail -F).
+    pkill -P $$ 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # Accept FIESTA_EXE from env var OR first positional arg.
 if [ -z "${FIESTA_EXE:-}" ] && [ -n "${1:-}" ]; then
@@ -200,6 +225,25 @@ cp -a "${SOURCE_DIR}" "${PROCESS_DIR}"
 if [ -d "${FIESTA_PATH}/9Data" ] && [ ! -e /server/9Data ]; then
     ln -s "${FIESTA_PATH}/9Data" /server/9Data
 fi
+
+# --- Clean stale logs that would trick the tailer ---
+# The exe writes Assert*/ExitLog*/Message*/MapLoad*/KQLog* etc. into its
+# process dir. With a persistent bind-mounted ServerSource those accumulate
+# across every run, and `cp -a` above just copied the whole pile into
+# /server. The Step-5 tailer reads each file from line 1 (`tail -F -n +1`),
+# so without this it re-ships months of old log content interleaved with
+# the current run. start.ps1 does the same thing ("Step 3: Clean stale
+# logs"); keep the two in sync. We clean the container-local /server copy
+# (what the exe writes to and what the tailer watches) and leave the
+# operator's bind-mounted originals untouched.
+echo "Cleaning stale logs in ${PROCESS_DIR}..."
+for _pat in 'Assert*.txt' 'ExitLog*.txt' 'Msg_*.txt' 'Dbg.txt' \
+            'MapLoad*.txt' 'Message*.txt' 'Size*.txt' '*CallStack*.txt' \
+            '5ZoneServer*.txt' 'KQLog*.txt' 'NormalLogOutLog*.txt' \
+            'MoreDisconnectLog*.txt'; do
+    find "${PROCESS_DIR}" -maxdepth 1 -type f -name "${_pat}" -delete 2>/dev/null || true
+done
+find "${PROCESS_DIR}/DebugMessage" -maxdepth 1 -type f -name '*.txt' -delete 2>/dev/null || true
 
 echo "=== Fiesta runtime (Linux/Wine) ==="
 echo "  Server folder : ${FIESTA_PATH}"
@@ -398,28 +442,41 @@ rewrite_config_file() {
                 fi
             fi
         elif [[ "${line}" == *ODBC_INFO* ]]; then
-            if [[ "${line}" == *"SERVER=.\\SQLEXPRESS"* ]]; then
-                line="${line//SERVER=.\\SQLEXPRESS/SERVER=${SQL_HOST},${SQL_PORT}}"
-                changed=1
-            fi
-            # Also rewrite SERVER=127.0.0.1,<port> (literal-IP form) when
-            # the operator set SQL_HOST to a different host (sibling
-            # container under docker DNS, etc.). Idempotent: if SQL_HOST
-            # defaults to 127.0.0.1, the substitution is a no-op.
-            if [[ "${line}" =~ SERVER=127\.0\.0\.1,[0-9]+ ]]; then
-                line=$(echo "${line}" | sed -E "s|SERVER=127\.0\.0\.1,[0-9]+|SERVER=${SQL_HOST},${SQL_PORT}|")
-                changed=1
-            fi
-            if [ "${ODBC_DRIVER}" != "SQL Server" ] && [[ "${line}" == *"DRIVER={SQL Server}"* ]]; then
-                line="${line//DRIVER=\{SQL Server\}/DRIVER=\{${ODBC_DRIVER}\}}"
-                changed=1
-            fi
-            if [ -n "${SA_PASSWORD:-}" ]; then
-                # Match PWD= followed by chars up to ; " whitespace.
-                if [[ "${line}" =~ ^(.*PWD=)([^\;\"$' \t']+)(.*)$ ]]; then
-                    if [ "${BASH_REMATCH[2]}" != "${SA_PASSWORD}" ]; then
-                        line="${BASH_REMATCH[1]}${SA_PASSWORD}${BASH_REMATCH[3]}"
+            if [ -n "${SQL_CONNECTION_STRING}" ]; then
+                # Full-string override: replace the connection-string field
+                # (second quoted string on the row -- the first is the
+                # bridge name like "Account") wholesale, leaving the init
+                # query (third quoted field, with USE <db>;) intact.
+                if [[ "${line}" =~ ^(.*ODBC_INFO[[:space:]]+\"[^\"]*\"[^\"]*)\"([^\"]+)\"(.*)$ ]]; then
+                    if [ "${BASH_REMATCH[2]}" != "${SQL_CONNECTION_STRING}" ]; then
+                        line="${BASH_REMATCH[1]}\"${SQL_CONNECTION_STRING}\"${BASH_REMATCH[3]}"
                         changed=1
+                    fi
+                fi
+            else
+                if [[ "${line}" == *"SERVER=.\\SQLEXPRESS"* ]]; then
+                    line="${line//SERVER=.\\SQLEXPRESS/SERVER=${SQL_HOST},${SQL_PORT}}"
+                    changed=1
+                fi
+                # Also rewrite SERVER=127.0.0.1,<port> (literal-IP form) when
+                # the operator set SQL_HOST to a different host (sibling
+                # container under docker DNS, etc.). Idempotent: if SQL_HOST
+                # defaults to 127.0.0.1, the substitution is a no-op.
+                if [[ "${line}" =~ SERVER=127\.0\.0\.1,[0-9]+ ]]; then
+                    line=$(echo "${line}" | sed -E "s|SERVER=127\.0\.0\.1,[0-9]+|SERVER=${SQL_HOST},${SQL_PORT}|")
+                    changed=1
+                fi
+                if [ "${ODBC_DRIVER}" != "SQL Server" ] && [[ "${line}" == *"DRIVER={SQL Server}"* ]]; then
+                    line="${line//DRIVER=\{SQL Server\}/DRIVER=\{${ODBC_DRIVER}\}}"
+                    changed=1
+                fi
+                if [ -n "${SA_PASSWORD:-}" ]; then
+                    # Match PWD= followed by chars up to ; " whitespace.
+                    if [[ "${line}" =~ ^(.*PWD=)([^\;\"$' \t']+)(.*)$ ]]; then
+                        if [ "${BASH_REMATCH[2]}" != "${SA_PASSWORD}" ]; then
+                            line="${BASH_REMATCH[1]}${SA_PASSWORD}${BASH_REMATCH[3]}"
+                            changed=1
+                        fi
                     fi
                 fi
             fi
@@ -510,8 +567,15 @@ fi
 WIN_EXE="Z:${EXE_PATH//\//\\}"
 
 # --- Step 1: Xvfb (Wine needs an X display even for headless services) ---
+# Xvfb's xkbcomp emits a wall of harmless "Could not resolve keysym XF86*"
+# warnings on startup (the X server's keysym table is older than the
+# xkeyboard-config data; the server itself says these are non-fatal). A
+# headless Fiesta service never touches a keyboard, so we send Xvfb's
+# stdout+stderr to a log file instead of the container's stdout -- it stays
+# inspectable via `docker exec ... cat /tmp/xvfb.log` if Xvfb ever misbehaves,
+# without flooding `docker logs`.
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
-Xvfb :99 -screen 0 800x600x24 -nolisten tcp &
+Xvfb :99 -screen 0 800x600x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
 export DISPLAY=:99
 sleep 1
 
@@ -584,7 +648,8 @@ if is_zone_active; then
         fi
         echo "Starting GamigoZR stub on 127.0.0.1:58492 (blob: ${CRYPT_BLOB_PATH})..."
         nginx -g 'daemon off;' &
-        echo "  GamigoZR stub nginx pid: $!"
+        NGINX_PID=$!
+        echo "  GamigoZR stub nginx pid: ${NGINX_PID}"
         STUB_STARTED=1
     else
         echo "WARN: IS_ZONE=true but CRYPT_BLOB_PATH (${CRYPT_BLOB_PATH}) not found;"
@@ -617,6 +682,37 @@ if [ "${STUB_STARTED}" -ne 1 ] && should_start_gamigozr; then
     else
         echo "WARN: GamigoZR.exe not found at ${GAMIGOZR_SRC}"
         echo "  Set START_GAMIGOZR=0 to skip, or GAMIGOZR_DIR=<your-dir> to override."
+    fi
+fi
+
+# --- Wait for SQL Server to be reachable ---
+# Mirrors start.ps1's SQL probe. The sqlserver container's healthcheck only
+# flips healthy after SELECT 1 works AND the .bak auto-restore finishes (see
+# the ready-marker in setup-sql.sh). In the compose stack `depends_on:
+# condition: service_healthy` already gates on that; this is a secondary
+# guard for non-compose runs / SQL restarts -- probe the SQL TCP port before
+# launching the exe so DB_Init doesn't fail straight into a restart loop
+# because SQL is a few seconds behind.
+: "${SQL_WAIT_SECONDS:=90}"
+if [ -n "${SA_PASSWORD:-}" ]; then
+    echo "Probing SQL connection ${SQL_HOST}:${SQL_PORT} (timeout ${SQL_WAIT_SECONDS}s)..."
+    sql_deadline=$(( $(date +%s) + SQL_WAIT_SECONDS ))
+    sql_ready=0
+    while [ "$(date +%s)" -lt "${sql_deadline}" ]; do
+        # bash /dev/tcp: opening the pseudo-path succeeds iff something is
+        # listening. Subshell-wrapped so a failed open can't leave a dangling
+        # fd and can't trip `set -e`.
+        if ( exec 3<>"/dev/tcp/${SQL_HOST}/${SQL_PORT}" ) 2>/dev/null; then
+            sql_ready=1
+            break
+        fi
+        sleep 2
+    done
+    if [ "${sql_ready}" -eq 1 ]; then
+        echo "  SQL port reachable."
+    else
+        echo "  WARN: SQL not reachable after ${SQL_WAIT_SECONDS}s; launching anyway"
+        echo "        (exe will likely DB_Init-fail; restart: on-failure recovers it)."
     fi
 fi
 
