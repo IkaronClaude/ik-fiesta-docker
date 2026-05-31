@@ -26,11 +26,22 @@ tree, GamigoZR crypt blob, and (optionally) XOR table at runtime.
 
 ## Quickstart
 
-### 1. Build the three images
+### 1. Get the images
 
-From the repo root (`fiesta-docker/`):
+**Linux containers — no build needed.** The `linux/` compose defaults to
+prebuilt images on Docker Hub, so there's nothing to build:
 
-**Windows containers:**
+```
+ikaronclaude/fiesta-server-runtime:latest
+ikaronclaude/fiesta-sql-runtime:latest
+ikaronclaude/fiesta-proxy:latest
+```
+
+`docker compose up -d` pulls them automatically. Skip to step 2.
+
+**Windows containers — build required.** The published images are
+linux/amd64 only; Windows containers need Windows-built images. From the
+repo root (`fiesta-docker/`), in Windows-containers mode:
 
 ```powershell
 docker build -t fiesta-server-runtime:latest -f Dockerfile.windows .
@@ -38,19 +49,14 @@ docker build -t fiesta-sql-runtime:latest    -f Dockerfile.sql.windows .
 docker build -t fiesta-proxy:latest          -f lib/fiesta-proxy/Dockerfile.windows lib/fiesta-proxy
 ```
 
-**Linux containers:**
-
-```bash
-docker build -t fiesta-server-runtime:latest -f Dockerfile.linux .
-docker build -t fiesta-sql-runtime:latest    -f Dockerfile.sql.linux .
-docker build -t fiesta-proxy:latest          -f lib/fiesta-proxy/Dockerfile lib/fiesta-proxy
-```
+(To build the Linux images yourself instead of pulling — for a custom
+change — see [`../README.md`](../README.md) "Building your own base
+images" and set `RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` in `.env` to the
+local tags.)
 
 > **Windows-host gotcha:** if Docker Desktop's experimental *Host networking*
 > toggle is on, `docker build` can't reach apt mirrors. Toggle it OFF for the
-> build, then back ON for `compose up`. (Bridge networking, which the
-> example uses, doesn't actually need the toggle — but if you flipped it on
-> for an earlier experiment, this is the bite.)
+> build, then back ON for `compose up`.
 
 ### 2. Bring your own (BYO) bits
 

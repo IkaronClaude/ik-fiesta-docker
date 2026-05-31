@@ -46,10 +46,10 @@ x-fiesta-env: &fiesta-env
   INTERNAL_HOST_GameLog_0:       "gamelog"
 
 x-fiesta: &fiesta
-  # Image refs default to the local-build tags. To pull from a registry,
-  # set RUNTIME_IMAGE / SQL_IMAGE / PROXY_IMAGE in .env -- the example
-  # compose forwards each value to the matching service.
-  image: "${RUNTIME_IMAGE:-fiesta-server-runtime:latest}"
+  # Defaults to the published Docker Hub image so a fresh clone runs with no
+  # local build. To use a locally-built image instead, set RUNTIME_IMAGE
+  # (e.g. RUNTIME_IMAGE=fiesta-server-runtime:latest) in .env.
+  image: "${RUNTIME_IMAGE:-ikaronclaude/fiesta-server-runtime:latest}"
   restart: on-failure
 
 services:
@@ -59,7 +59,7 @@ services:
   # `docker compose up -d` brings it up. For external SQL: drop the profile
   # in .env, set SQL_HOST in .env, and the bridges talk to your DB directly.
   sqlserver:
-    image: "${SQL_IMAGE:-fiesta-sql-runtime:latest}"
+    image: "${SQL_IMAGE:-ikaronclaude/fiesta-sql-runtime:latest}"
     profiles: ["bundled-sql"]
     restart: on-failure
     environment:
@@ -253,7 +253,7 @@ services:
       worldmanager: { condition: service_started }
 
   proxy:
-    image: "${PROXY_IMAGE:-fiesta-proxy:latest}"
+    image: "${PROXY_IMAGE:-ikaronclaude/fiesta-proxy:latest}"
     restart: on-failure
     environment:
       PUBLIC_IP: "${PUBLIC_IP:?}"
