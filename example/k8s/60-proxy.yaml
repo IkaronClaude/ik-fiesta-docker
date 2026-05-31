@@ -1,0 +1,71 @@
+# Client-facing FiestaProxy -- the ONLY externally-exposed game component.
+# Players connect here; it rewrites the WM/Zone endpoints in
+# WORLDSELECT_ACK / CHAR_LOGIN_ACK to PUBLIC_IP and forwards to the runtime
+# pods over cluster DNS. Login/WM routes rewrite; zone routes are opaque.
+#
+# EXTERNAL EXPOSURE: this uses a LoadBalancer Service (most portable -- works
+# with k3s servicelb, MetalLB, or a cloud LB). Make sure PUBLIC_IP in
+# game-env matches the address clients actually reach this LB on.
+# Alternatives if you have no LoadBalancer:
+#   - NodePort: change `type: LoadBalancer` -> `type: NodePort` (note: node
+#     ports are 30000-32767, so clients would connect to those, not 9010 etc.
+#     -- only viable if you also remap PROXY_ROUTES listen ports / EXTERNAL_PORT_*).
+#   - Traefik TCP: drop the Service, run this as a DaemonSet, add TCP
+#     entrypoints for the 7 ports + IngressRouteTCP (HostSNI(`*`)) per port.
+#
+# Scale to multiple replicas freely -- the proxy is per-connection stateless.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: fiesta-proxy, namespace: fiesta, labels: { app: fiesta-proxy, tier: game } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: fiesta-proxy } }
+  template:
+    metadata: { labels: { app: fiesta-proxy, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: proxy
+          image: ikaronclaude/fiesta-proxy:latest
+          env:
+            - name: PUBLIC_IP
+              valueFrom: { configMapKeyRef: { name: game-env, key: PUBLIC_IP } }
+            # Or DNS-resolve a hostname at startup instead of a literal IP:
+            # - { name: PUBLIC_HOST, value: "fiesta.example.com" }
+            - name: PROXY_ROUTES
+              value: >-
+                9010:Login:login.fiesta.svc.cluster.local:9010;
+                9013:WorldManager_0:worldmanager.fiesta.svc.cluster.local:9013;
+                9016:Zone_0_0:zone00.fiesta.svc.cluster.local:9016:opaque;
+                9019:Zone_0_1:zone01.fiesta.svc.cluster.local:9019:opaque;
+                9022:Zone_0_2:zone02.fiesta.svc.cluster.local:9022:opaque;
+                9025:Zone_0_3:zone03.fiesta.svc.cluster.local:9025:opaque;
+                9028:Zone_0_4:zone04.fiesta.svc.cluster.local:9028:opaque
+            - { name: PROXY_PACKET_LOG, value: "" }   # set "1" for per-frame trace
+          ports:
+            - { containerPort: 9010 }
+            - { containerPort: 9013 }
+            - { containerPort: 9016 }
+            - { containerPort: 9019 }
+            - { containerPort: 9022 }
+            - { containerPort: 9025 }
+            - { containerPort: 9028 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 1000m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: fiesta-proxy, namespace: fiesta, labels: { app: fiesta-proxy, tier: game } }
+spec:
+  type: LoadBalancer
+  selector: { app: fiesta-proxy }
+  ports:
+    - { name: login, port: 9010, targetPort: 9010 }
+    - { name: wm,    port: 9013, targetPort: 9013 }
+    - { name: zone0, port: 9016, targetPort: 9016 }
+    - { name: zone1, port: 9019, targetPort: 9019 }
+    - { name: zone2, port: 9022, targetPort: 9022 }
+    - { name: zone3, port: 9025, targetPort: 9025 }
+    - { name: zone4, port: 9028, targetPort: 9028 }

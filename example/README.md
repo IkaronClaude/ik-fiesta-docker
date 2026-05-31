@@ -1,6 +1,10 @@
-# `example/` — full Fiesta server stack on Docker Compose
+# `example/` — full Fiesta server stack
 
-Two parallel compose files for the same 11-container stack:
+Running on **Kubernetes**? See [`k8s/`](k8s/) — the same bridge+proxy
+topology as plain manifests (`kubectl apply -k example/k8s/`).
+
+The rest of this doc covers the **Docker Compose** path: two parallel
+compose files for the same 11-container stack:
 
 | Path | Engine | Runtime |
 |------|--------|---------|

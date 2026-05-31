@@ -1,0 +1,62 @@
+# Bundled SQL Server (fiesta-sql-runtime) -- auto-restores the .bak files
+# from your Databases/ dir on first boot. To use an EXTERNAL SQL Server
+# instead, delete this file and point game-env.SQL_HOST at your server.
+#
+# Data lives on its own RWO PVC (SQL needs POSIX-strict storage -- do NOT
+# put it on NFS). The .bak backups are read from the shared NFS ServerSource
+# (Databases/ subdir, read-only).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: mssql-data, namespace: fiesta }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+  # storageClassName omitted -> cluster default (e.g. local-path). A bind
+  # mount-equivalent; survives pod restarts, wiped only by deleting the PVC.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: mssql, namespace: fiesta, labels: { app: mssql, tier: data } }
+spec:
+  serviceName: mssql
+  replicas: 1
+  selector: { matchLabels: { app: mssql } }
+  template:
+    metadata: { labels: { app: mssql, tier: data } }
+    spec:
+      securityContext: { fsGroup: 10001 }
+      containers:
+        - name: mssql
+          image: ikaronclaude/fiesta-sql-runtime:latest
+          env:
+            - { name: ACCEPT_EULA, value: "Y" }
+            - { name: MSSQL_PID,   value: Developer }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+            - name: MSSQL_SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          ports: [{ containerPort: 1433 }]
+          volumeMounts:
+            - { name: data, mountPath: /var/opt/mssql }
+            - { name: backups, mountPath: /var/opt/mssql/backup, subPath: Databases, readOnly: true }
+          readinessProbe:
+            exec: { command: ["/usr/local/bin/healthcheck-sql.sh"] }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30        # generous: first-boot .bak restore takes a while
+          resources:
+            requests: { cpu: 200m, memory: 1536Mi }
+            limits: { cpu: 2000m, memory: 4Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: mssql-data }
+        - name: backups
+          persistentVolumeClaim: { claimName: fiesta-source }   # NFS; reads Databases/
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mssql, namespace: fiesta }
+spec:
+  selector: { app: mssql }
+  ports: [{ port: 1433, targetPort: 1433 }]

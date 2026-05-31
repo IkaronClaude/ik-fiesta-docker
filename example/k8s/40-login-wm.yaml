@@ -1,0 +1,71 @@
+# login (client 9010) and worldmanager (client 9013) + headless Services.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: login, namespace: fiesta, labels: { app: login, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: login } }
+  template:
+    metadata: { labels: { app: login, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: Login/Login.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 300m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: login, namespace: fiesta, labels: { app: login, tier: game } }
+spec: { clusterIP: None, selector: { app: login }, ports: [{ name: client, port: 9010, targetPort: 9010 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: worldmanager, namespace: fiesta, labels: { app: worldmanager, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: worldmanager } }
+  template:
+    metadata: { labels: { app: worldmanager, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: WorldManager/WorldManager.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 300m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: worldmanager, namespace: fiesta, labels: { app: worldmanager, tier: game } }
+spec: { clusterIP: None, selector: { app: worldmanager }, ports: [{ name: client, port: 9013, targetPort: 9013 }] }

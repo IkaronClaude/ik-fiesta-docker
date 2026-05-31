@@ -1,0 +1,46 @@
+# Namespace + shared config + SA password secret.
+#
+# EDIT before applying:
+#   - game-env.PUBLIC_IP  -> the IP/host your players reach the proxy on
+#   - the Secret's SA_PASSWORD (or replace with your own Secret / SealedSecret)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fiesta
+---
+# Shared env for every fiesta-server-runtime pod. The baked-in s2s proxy
+# resolves INTERNAL_HOST_<svc> (the headless Service names below) per
+# connection. SA_PASSWORD is injected separately from the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: game-env
+  namespace: fiesta
+  labels: { tier: game }
+data:
+  PUBLIC_IP: "YOUR.PUBLIC.IP"          # <-- EDIT: advertised to clients
+  SQL_HOST: "mssql"                    # the SQL Service name (20-sql.yaml)
+  SQL_PORT: "1433"
+  INTERNAL_HOST_Login:           "login"
+  INTERNAL_HOST_WorldManager_0:  "worldmanager"
+  INTERNAL_HOST_Zone_0_0:        "zone00"
+  INTERNAL_HOST_Zone_0_1:        "zone01"
+  INTERNAL_HOST_Zone_0_2:        "zone02"
+  INTERNAL_HOST_Zone_0_3:        "zone03"
+  INTERNAL_HOST_Zone_0_4:        "zone04"
+  INTERNAL_HOST_Account:         "account"
+  INTERNAL_HOST_AccountLog:      "accountlog"
+  INTERNAL_HOST_Character_0:     "character"
+  INTERNAL_HOST_GameLog_0:       "gamelog"
+---
+# SA password. For a real deployment use a SealedSecret / external secret
+# manager instead of a plaintext Secret in git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fiesta-sql
+  namespace: fiesta
+type: Opaque
+stringData:
+  SA_PASSWORD: "ChangeMe!Strong1"      # <-- EDIT

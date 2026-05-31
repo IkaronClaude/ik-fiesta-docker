@@ -1,0 +1,67 @@
+# Shared ServerSource over NFS (ReadWriteMany) so game pods run on ANY node.
+#
+# Most k8s clusters have no RWX storage class (local-path is node-local), so
+# this serves your ServerSource tree from one node over NFS and exposes it
+# as an RWX PVC. Game pods mount it for /fiesta + /source.
+#
+# PREREQUISITES:
+#   1. Put your ServerSource tree on ONE node at the hostPath below, incl.
+#      9Data/, the process dirs (Login/, Zone00/, ...), GamigoZR/, Databases/.
+#   2. Pin this NFS server to THAT node (set the nodeSelector hostname).
+#   3. Install `nfs-common` on EVERY node that may run game pods
+#      (`apt-get install -y nfs-common`) -- without the mount.nfs helper the
+#      PVC mount fails with "exit status 32".
+#   4. Set the PV's nfs.server to that node's cluster-routable IP.
+#
+# Single-node alternative: skip this file, and in the game manifests replace
+# the `fiesta-source` PVC volume with a hostPath to your ServerSource, pinned
+# to that node. Simpler, but pods can't spread across nodes.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: nfs-server, namespace: fiesta, labels: { app: nfs-server, tier: data } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: nfs-server } }
+  template:
+    metadata: { labels: { app: nfs-server, tier: data } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: CHANGE-ME-DATA-NODE }   # <-- EDIT
+      hostNetwork: true   # so the PV can target the node's stable IP
+      containers:
+        - name: nfs
+          image: itsthenetwork/nfs-server-alpine:12   # docker.io
+          securityContext: { privileged: true }
+          env:
+            - { name: SHARED_DIRECTORY, value: /export }
+          ports: [{ containerPort: 2049, hostPort: 2049 }]
+          volumeMounts: [{ name: export, mountPath: /export }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 1000m, memory: 512Mi }
+      volumes:
+        - name: export
+          hostPath: { path: /root/fiesta-files, type: Directory }     # <-- EDIT: your ServerSource path
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: fiesta-source, labels: { app: fiesta-source } }
+spec:
+  capacity: { storage: 50Gi }       # NFS ignores this; required field only
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: [nfsvers=4.1, nolock]
+  nfs:
+    server: CHANGE-ME-NODE-IP       # <-- EDIT: data node's cluster-routable IP
+    path: /                         # itsthenetwork exports SHARED_DIRECTORY as the fsid=0 root
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: fiesta-source, namespace: fiesta }
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: fiesta-source
+  resources: { requests: { storage: 50Gi } }

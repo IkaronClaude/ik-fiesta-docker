@@ -1,0 +1,13 @@
+# kubectl apply -k example/k8s/
+# (or apply the numbered files in order with `kubectl apply -f`)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: fiesta
+resources:
+  - 00-namespace-config.yaml
+  - 10-nfs.yaml
+  - 20-sql.yaml
+  - 30-db-bridges.yaml
+  - 40-login-wm.yaml
+  - 50-zones.yaml
+  - 60-proxy.yaml

@@ -1,0 +1,144 @@
+# DB bridges: account / accountlog / character / gamelog.
+# Cluster pod network; each gets a headless Service for s2s name resolution.
+# All default replicas: 0 -- scale with:
+#   kubectl scale -n fiesta -l tier=game deploy --replicas=1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: account, namespace: fiesta, labels: { app: account, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: account } }
+  template:
+    metadata: { labels: { app: account, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: Account/Account.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: account, namespace: fiesta, labels: { app: account, tier: game } }
+spec: { clusterIP: None, selector: { app: account }, ports: [{ name: db, port: 9031, targetPort: 9031 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: accountlog, namespace: fiesta, labels: { app: accountlog, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: accountlog } }
+  template:
+    metadata: { labels: { app: accountlog, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: AccountLog/AccountLog.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: accountlog, namespace: fiesta, labels: { app: accountlog, tier: game } }
+spec: { clusterIP: None, selector: { app: accountlog }, ports: [{ name: db, port: 9032, targetPort: 9032 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: character, namespace: fiesta, labels: { app: character, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: character } }
+  template:
+    metadata: { labels: { app: character, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: Character/Character.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: character, namespace: fiesta, labels: { app: character, tier: game } }
+spec: { clusterIP: None, selector: { app: character }, ports: [{ name: db, port: 9033, targetPort: 9033 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: gamelog, namespace: fiesta, labels: { app: gamelog, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: gamelog } }
+  template:
+    metadata: { labels: { app: gamelog, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE, value: GameLog/GameLog.exe }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { cpu: 2000m, memory: 1536Mi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: gamelog, namespace: fiesta, labels: { app: gamelog, tier: game } }
+spec: { clusterIP: None, selector: { app: gamelog }, ports: [{ name: db, port: 9034, targetPort: 9034 }] }

@@ -1,0 +1,203 @@
+# 5 zones (client ports 9016/9019/9022/9025/9028) + headless Services.
+# Each runs its own GamigoZR crypt-blob stub (IS_ZONE=1); the blob comes from
+# the `gamigozr-blob` ConfigMap, which you create from your response.txt:
+#   kubectl create configmap gamigozr-blob -n fiesta --from-file=response.txt=./response.txt
+#
+# requests cpu:1 (floor; bursts to the 4-core limit during map load) and
+# mem:2560Mi (real-use floor; memory is the binding/OOM-safety constraint).
+# All default replicas: 0.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zone00, namespace: fiesta, labels: { app: zone00, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zone00 } }
+  template:
+    metadata: { labels: { app: zone00, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE,     value: Zone00/Zone.exe }
+            - { name: IS_ZONE,        value: "1" }
+            - { name: START_GAMIGOZR, value: "0" }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+            - { name: gamigozr, mountPath: /etc/gamigozr, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 2560Mi }
+            limits: { cpu: "4", memory: 6Gi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+        - { name: gamigozr, configMap: { name: gamigozr-blob } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zone00, namespace: fiesta, labels: { app: zone00, tier: game } }
+spec: { clusterIP: None, selector: { app: zone00 }, ports: [{ name: client, port: 9016, targetPort: 9016 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zone01, namespace: fiesta, labels: { app: zone01, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zone01 } }
+  template:
+    metadata: { labels: { app: zone01, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE,     value: Zone01/Zone.exe }
+            - { name: IS_ZONE,        value: "1" }
+            - { name: START_GAMIGOZR, value: "0" }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+            - { name: gamigozr, mountPath: /etc/gamigozr, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 2560Mi }
+            limits: { cpu: "4", memory: 6Gi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+        - { name: gamigozr, configMap: { name: gamigozr-blob } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zone01, namespace: fiesta, labels: { app: zone01, tier: game } }
+spec: { clusterIP: None, selector: { app: zone01 }, ports: [{ name: client, port: 9019, targetPort: 9019 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zone02, namespace: fiesta, labels: { app: zone02, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zone02 } }
+  template:
+    metadata: { labels: { app: zone02, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE,     value: Zone02/Zone.exe }
+            - { name: IS_ZONE,        value: "1" }
+            - { name: START_GAMIGOZR, value: "0" }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+            - { name: gamigozr, mountPath: /etc/gamigozr, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 2560Mi }
+            limits: { cpu: "4", memory: 6Gi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+        - { name: gamigozr, configMap: { name: gamigozr-blob } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zone02, namespace: fiesta, labels: { app: zone02, tier: game } }
+spec: { clusterIP: None, selector: { app: zone02 }, ports: [{ name: client, port: 9022, targetPort: 9022 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zone03, namespace: fiesta, labels: { app: zone03, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zone03 } }
+  template:
+    metadata: { labels: { app: zone03, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE,     value: Zone03/Zone.exe }
+            - { name: IS_ZONE,        value: "1" }
+            - { name: START_GAMIGOZR, value: "0" }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+            - { name: gamigozr, mountPath: /etc/gamigozr, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 2560Mi }
+            limits: { cpu: "4", memory: 6Gi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+        - { name: gamigozr, configMap: { name: gamigozr-blob } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zone03, namespace: fiesta, labels: { app: zone03, tier: game } }
+spec: { clusterIP: None, selector: { app: zone03 }, ports: [{ name: client, port: 9025, targetPort: 9025 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zone04, namespace: fiesta, labels: { app: zone04, tier: game } }
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zone04 } }
+  template:
+    metadata: { labels: { app: zone04, tier: game } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: server
+          image: ikaronclaude/fiesta-server-runtime:latest
+          envFrom: [{ configMapRef: { name: game-env } }]
+          env:
+            - { name: FIESTA_EXE,     value: Zone04/Zone.exe }
+            - { name: IS_ZONE,        value: "1" }
+            - { name: START_GAMIGOZR, value: "0" }
+            - name: SA_PASSWORD
+              valueFrom: { secretKeyRef: { name: fiesta-sql, key: SA_PASSWORD } }
+          volumeMounts:
+            - { name: fiesta, mountPath: /fiesta }
+            - { name: fiesta, mountPath: /source, readOnly: true }
+            - { name: serverinfo, mountPath: /fiesta/9Data/ServerInfo }
+            - { name: gamigozr, mountPath: /etc/gamigozr, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: 2560Mi }
+            limits: { cpu: "4", memory: 6Gi }
+      volumes:
+        - { name: fiesta, persistentVolumeClaim: { claimName: fiesta-source } }
+        - { name: serverinfo, emptyDir: {} }
+        - { name: gamigozr, configMap: { name: gamigozr-blob } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zone04, namespace: fiesta, labels: { app: zone04, tier: game } }
+spec: { clusterIP: None, selector: { app: zone04 }, ports: [{ name: client, port: 9028, targetPort: 9028 }] }
