@@ -28,8 +28,8 @@ The images ship **no game files**. You supply:
 2. **A GamigoZR crypt blob** (`response.txt`) — extract once from a real
    GamigoZR (`curl http://127.0.0.1:58492/ > response.txt`; recipe in
    `Dockerfile.gamigozr-stub`). Each zone serves it to clients.
-3. *(optional)* an **XOR table** — only used by the proxy to decrypt C→S
-   packets for logging; the proxy runs fine without it.
+3. **The XOR cipher table** — the c2s packet cipher. Required. Drop your
+   table into `xor/` and point `XOR_TABLE_PATH` (or `XOR_TABLE_HEX`) at it.
 
 You also choose **`PUBLIC_IP`** — the address your players actually connect
 to (LAN IP, WAN/forwarded IP, or `127.0.0.1` for a local-only test).
