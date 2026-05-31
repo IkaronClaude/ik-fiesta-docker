@@ -26,10 +26,11 @@ tree, GamigoZR crypt blob, and (optionally) XOR table at runtime.
 
 ## Quickstart
 
-### 1. Get the images
+### 1. Get the images — no build needed
 
-**Linux containers — no build needed.** The `linux/` compose defaults to
-prebuilt images on Docker Hub, so there's nothing to build:
+Both the `linux/` and `windows/` compose files default to **multi-arch**
+images on Docker Hub (one tag, both OSes — Docker pulls the right variant
+for your engine):
 
 ```
 ikaronclaude/fiesta-server-runtime:latest
@@ -37,26 +38,15 @@ ikaronclaude/fiesta-sql-runtime:latest
 ikaronclaude/fiesta-proxy:latest
 ```
 
-`docker compose up -d` pulls them automatically. Skip to step 2.
+`docker compose up -d` pulls them automatically — skip to step 2.
 
-**Windows containers — build required.** The published images are
-linux/amd64 only; Windows containers need Windows-built images. From the
-repo root (`fiesta-docker/`), in Windows-containers mode:
+To build the images yourself instead (a custom change, air-gapped, etc.),
+see [`../README.md`](../README.md) "Building your own base images" and set
+`RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` in `.env` to your local tags.
 
-```powershell
-docker build -t fiesta-server-runtime:latest -f Dockerfile.windows .
-docker build -t fiesta-sql-runtime:latest    -f Dockerfile.sql.windows .
-docker build -t fiesta-proxy:latest          -f lib/fiesta-proxy/Dockerfile.windows lib/fiesta-proxy
-```
-
-(To build the Linux images yourself instead of pulling — for a custom
-change — see [`../README.md`](../README.md) "Building your own base
-images" and set `RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` in `.env` to the
-local tags.)
-
-> **Windows-host gotcha:** if Docker Desktop's experimental *Host networking*
-> toggle is on, `docker build` can't reach apt mirrors. Toggle it OFF for the
-> build, then back ON for `compose up`.
+> **Windows-host build gotcha (only if you build locally):** if Docker
+> Desktop's experimental *Host networking* toggle is on, `docker build`
+> can't reach apt mirrors. Toggle it OFF to build, back ON to run.
 
 ### 2. Bring your own (BYO) bits
 
