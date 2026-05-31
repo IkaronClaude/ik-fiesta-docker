@@ -216,7 +216,18 @@ EXE_PATH="${PROCESS_DIR}/${PROCESS_EXE}"
 mkdir -p "$(dirname "${PROCESS_DIR}")"
 echo "Copying ${SOURCE_DIR}/ -> ${PROCESS_DIR}/ (bind-mount exec workaround)..."
 rm -rf "${PROCESS_DIR}"
-cp -a "${SOURCE_DIR}" "${PROCESS_DIR}"
+# `cp -a` preserves mode+ownership+timestamps+xattrs. That works over a 9P /
+# Windows bind mount but FAILS over NFS, where preserving perms/xattrs raises
+# "Operation not supported" and cp exits non-zero (killing start.sh under
+# set -e). The exe only needs to be readable from the container-local copy --
+# ownership/xattrs are irrelevant -- so fall back to a plain recursive copy
+# (deref symlinks, no preserve) when -a can't be honoured by the source fs.
+if ! cp -a "${SOURCE_DIR}" "${PROCESS_DIR}" 2>/dev/null; then
+    echo "  cp -a not supported by source fs (e.g. NFS) -- copying without preserve"
+    rm -rf "${PROCESS_DIR}"
+    mkdir -p "${PROCESS_DIR}"
+    cp -rL "${SOURCE_DIR}/." "${PROCESS_DIR}/"
+fi
 
 # The exe resolves 9Data via relative paths like "../../9Data/...". With the
 # process dir now under /server, link /server/9Data back to the bind mount so
