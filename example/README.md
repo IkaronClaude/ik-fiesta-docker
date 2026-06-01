@@ -61,6 +61,16 @@ docker compose logs -f login
 Point a Fiesta client at `PUBLIC_IP:9010`. That's it — the Linux example
 pulls `ikaronclaude/fiesta-*:latest`; the Windows example does too (multi-arch).
 
+> **Stock files? Nothing to configure** — the shipped `PROXY_ROUTES`, `ports:`,
+> and `INTERNAL_HOST_*` are already wired for the standard 5-zone layout.
+> **Different files** (extra zones, different ports, more worlds)? Don't
+> hand-edit — regenerate the proxy block from your own `ServerInfo.txt` in one
+> command and paste it in:
+> ```bash
+> ../../gen-proxy-config.sh --server-info /path/to/ServerInfo.txt --public-ip "$PUBLIC_IP"
+> ```
+> See [Regenerating the proxy config](#regenerating-the-proxy-config).
+
 Create a test account (raw **uppercase** MD5 — see pitfalls):
 
 ```bash
@@ -93,6 +103,10 @@ kubectl scale -n fiesta -l tier=game deploy --replicas=1
 
 Players connect to the `fiesta-proxy` LoadBalancer IP on `:9010`.
 
+> Stock 5-zone files work as shipped. For a different layout, regenerate the
+> proxy env in `k8s/60-proxy.yaml`:
+> `./gen-proxy-config.sh --server-info /path/to/ServerInfo.txt --format k8s --host-suffix .fiesta.svc.cluster.local`
+
 ---
 
 ## Configuration
@@ -103,6 +117,28 @@ Players connect to the `fiesta-proxy` LoadBalancer IP on `:9010`.
 | `SA_PASSWORD` | `.env` / `fiesta-sql` Secret | Meet SQL's complexity policy (8+ chars, mixed). |
 | `RUNTIME_IMAGE`/`SQL_IMAGE`/`PROXY_IMAGE` | compose `.env` | Override the Hub defaults to use locally-built tags. |
 | `PROXY_PACKET_LOG=1` | proxy env | Per-frame opcode trace. Off by default. |
+
+### Regenerating the proxy config
+
+The example ships a `PROXY_ROUTES` string (and matching `ports:` /
+`INTERNAL_HOST_*` map) wired for the stock five-zone topology. If your server
+files have a different layout (extra zones, different ports, more worlds), don't
+hand-edit it — generate it from your own `ServerInfo.txt`:
+
+```bash
+# Linux / macOS                          # Windows (PowerShell)
+./gen-proxy-config.sh \                  .\gen-proxy-config.ps1 `
+  --server-info path/to/ServerInfo.txt \   -ServerInfo path\to\ServerInfo.txt `
+  --public-ip 203.0.113.7                  -PublicIp 203.0.113.7
+```
+
+It reads the `SERVER_INFO` rows, emits one route per client-facing row
+(`FromServerType == 20`, i.e. the `; PUBLIC_IP` rows; zones get `:opaque`), and
+prints the `ports:` list plus the `INTERNAL_HOST_*` map. `--format env` gives a
+single-line dotenv form; `--format k8s --host-suffix .fiesta.svc.cluster.local`
+emits the cluster-DNS variant for `k8s/60-proxy.yaml`. Paste the output into the
+compose/k8s file. Service names match what the runtime (`start.sh`/`start.ps1`)
+expects, so the proxy and the exes agree.
 
 ### Database / SQL options
 
