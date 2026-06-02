@@ -56,7 +56,7 @@ ENV ACCEPT_EULA=Y \
 
 LABEL org.opencontainers.image.title="fiesta-sql-runtime" \
       org.opencontainers.image.description="Bring-your-own SQL Server image with auto-restore of .bak files (Linux)" \
-      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ik-fiesta-docker"
 
 # Override the base image's ENTRYPOINT -- our setup script owns the sqlservr
 # lifecycle (start in background, restore, then wait).

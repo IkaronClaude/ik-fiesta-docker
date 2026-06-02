@@ -97,6 +97,6 @@ ENV SA_PASSWORD="" \
 
 LABEL org.opencontainers.image.title="fiesta-sql-runtime" \
       org.opencontainers.image.description="Bring-your-own SQL Server image with auto-restore of .bak files (Windows)" \
-      org.opencontainers.image.source="https://github.com/IkaronClaude/ProjectMimir"
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ik-fiesta-docker"
 
 ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:/setup-sql.ps1"]
