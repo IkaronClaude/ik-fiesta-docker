@@ -3,7 +3,7 @@
 # instead, delete this file and point game-env.SQL_HOST at your server.
 #
 # Data lives on its own RWO PVC (SQL needs POSIX-strict storage -- do NOT
-# put it on NFS). The .bak backups are read from the shared NFS ServerSource
+# put it on NFS). The .bak backups are read from the shared NFS server files
 # (Databases/ subdir, read-only).
 ---
 apiVersion: v1

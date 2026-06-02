@@ -1,11 +1,11 @@
-# Shared ServerSource over NFS (ReadWriteMany) so game pods run on ANY node.
+# Shared server files over NFS (ReadWriteMany) so game pods run on ANY node.
 #
 # Most k8s clusters have no RWX storage class (local-path is node-local), so
-# this serves your ServerSource tree from one node over NFS and exposes it
+# this serves your server files tree from one node over NFS and exposes it
 # as an RWX PVC. Game pods mount it for /fiesta + /source.
 #
 # PREREQUISITES:
-#   1. Put your ServerSource tree on ONE node at the hostPath below, incl.
+#   1. Put your server files tree on ONE node at the hostPath below, incl.
 #      9Data/, the process dirs (Login/, Zone00/, ...), GamigoZR/, Databases/.
 #   2. Pin this NFS server to THAT node (set the nodeSelector hostname).
 #   3. Install `nfs-common` on EVERY node that may run game pods
@@ -14,7 +14,7 @@
 #   4. Set the PV's nfs.server to that node's cluster-routable IP.
 #
 # Single-node alternative: skip this file, and in the game manifests replace
-# the `fiesta-source` PVC volume with a hostPath to your ServerSource, pinned
+# the `fiesta-source` PVC volume with a hostPath to your server files, pinned
 # to that node. Simpler, but pods can't spread across nodes.
 ---
 apiVersion: apps/v1
@@ -42,7 +42,7 @@ spec:
             limits: { cpu: 1000m, memory: 512Mi }
       volumes:
         - name: export
-          hostPath: { path: /root/fiesta-files, type: Directory }     # <-- EDIT: your ServerSource path
+          hostPath: { path: /root/fiesta-files, type: Directory }     # <-- EDIT: your server files path
 ---
 apiVersion: v1
 kind: PersistentVolume

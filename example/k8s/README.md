@@ -19,7 +19,7 @@ Kubernetes manifests. Mirrors the design that runs the live Ikaron cluster.
   name (the baked-in proxy resolves `INTERNAL_HOST_*` per connection).
 - **fiesta-proxy** is the only externally-exposed component.
 - Each zone runs its own GamigoZR crypt-blob stub.
-- The ServerSource tree is shared to all nodes over **NFS (RWX)** so game
+- The server files tree is shared to all nodes over **NFS (RWX)** so game
   pods aren't pinned to one node.
 
 Images are the published multi-arch Docker Hub builds
@@ -27,7 +27,7 @@ Images are the published multi-arch Docker Hub builds
 
 ## Prerequisites
 
-1. **ServerSource on one node.** Put your `ServerSource`-shaped tree
+1. **server files on one node.** Put your `server files`-shaped tree
    (`9Data/`, `Login/`, `Zone00/`…`Zone04/`, `GamigoZR/`, `Databases/`) on a
    node's filesystem (default path `/root/fiesta-files`).
 2. **`nfs-common` on every node** that may run game pods:
@@ -43,7 +43,7 @@ Edit before applying:
 | File | Field |
 |------|-------|
 | `00-namespace-config.yaml` | `game-env.PUBLIC_IP` (the LB address clients reach) and the `fiesta-sql` Secret `SA_PASSWORD` |
-| `10-nfs.yaml` | the data node's `nodeSelector` hostname, the `hostPath` to your ServerSource, and the PV's `nfs.server` (that node's cluster-routable IP) |
+| `10-nfs.yaml` | the data node's `nodeSelector` hostname, the `hostPath` to your server files, and the PV's `nfs.server` (that node's cluster-routable IP) |
 
 Create the GamigoZR blob ConfigMap (the zones mount it):
 
@@ -78,7 +78,7 @@ Point a Fiesta client at `PUBLIC_IP:9010`.
   World00_Character, World00_GameLog, StatisticsData, OperatorTool) there.
 - **Single-node (no NFS):** skip `10-nfs.yaml`, and in the game manifests
   replace the `fiesta-source` PVC volume with a `hostPath` to your
-  ServerSource pinned (`nodeSelector`) to that node. Simpler, but no spread.
+  server files pinned (`nodeSelector`) to that node. Simpler, but no spread.
 - **Proxy exposure:** `60-proxy.yaml` uses a `LoadBalancer` Service. See its
   header for NodePort / Traefik-TCP alternatives if you have no LB.
 - **External players** must be able to reach the LB IP on all 7 TCP ports.

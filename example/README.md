@@ -15,19 +15,19 @@ Pick one:
 
 The images ship **no game files**. You supply:
 
-1. **A ServerSource tree** — the standard layout:
+1. **Your server files** — the standard layout:
    ```
-   ServerSource/
+   server-files/
    ├── 9Data/                    game data + configs
    ├── Login/Login.exe   WorldManager/WorldManager.exe
    ├── Account/  AccountLog/  Character/  GameLog/    (each *.exe)
    ├── Zone00/Zone.exe … Zone04/Zone.exe
-   ├── GamigoZR/GamigoZR.exe
    └── Databases/                your *.bak files (restored on first SQL boot)
    ```
-2. **A GamigoZR crypt blob** (`response.txt`) — extract once from a real
-   GamigoZR (`curl http://127.0.0.1:58492/ > response.txt`; recipe in
-   `Dockerfile.gamigozr-stub`). Each zone serves it to clients.
+2. **A GamigoZR crypt blob** (`response.txt`) — only needed for the Zone exe,
+   which serves it to clients. Extract it once from a real GamigoZR
+   (`curl http://127.0.0.1:58492/ > response.txt`; recipe in
+   `Dockerfile.gamigozr-stub`). The real `GamigoZR.exe` itself isn't needed.
 3. **The XOR cipher table** — the c2s packet cipher. Required. Drop your
    table into `xor/` and point `XOR_TABLE_PATH` (or `XOR_TABLE_HEX`) at it.
 
@@ -46,7 +46,7 @@ cp .env.example .env
 Edit `.env` — three required values:
 
 ```ini
-FIESTA_SERVER=/abs/path/to/ServerSource
+FIESTA_SERVER=/abs/path/to/server-files
 SA_PASSWORD=ChangeMe!Strong1
 PUBLIC_IP=127.0.0.1            # the IP your client connects to
 ```
@@ -89,7 +89,7 @@ Down: `docker compose down` (data is safe — see [DB persistence](#database--sq
 Full detail in [`k8s/README.md`](k8s/README.md). Minimal path:
 
 ```bash
-# 1. Put ServerSource on one node (default /root/fiesta-files) and install
+# 1. Put server files on one node (default /root/fiesta-files) and install
 #    nfs-common on every node:   apt-get install -y nfs-common
 # 2. Edit example/k8s/00-namespace-config.yaml (PUBLIC_IP, SA_PASSWORD)
 #        and example/k8s/10-nfs.yaml (data node name + its IP + hostPath)
@@ -192,7 +192,7 @@ Everything below is a real failure we hit and fixed — symptom → cause → fi
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Old/duplicate log lines interleaved in container output (Linux) | The persisted ServerSource accumulates `Assert*/KQLog*/Message*` across runs; the tailer re-reads them from line 1. | Fixed in the image — `start.sh` cleans stale logs before launch. Use a current image. |
+| Old/duplicate log lines interleaved in container output (Linux) | The persisted server files accumulates `Assert*/KQLog*/Message*` across runs; the tailer re-reads them from line 1. | Fixed in the image — `start.sh` cleans stale logs before launch. Use a current image. |
 | Wall of `Could not resolve keysym XF86…` warnings (Linux) | Harmless `xkbcomp` noise from Xvfb. | Fixed — Xvfb output is redirected to `/tmp/xvfb.log`. |
 | Hundreds of `s2s outbound accept/close` lines flooding logs | Per-connection s2s logging on by default. | Fixed — gated behind `PROXY_PACKET_LOG=1`. |
 | `docker build` hangs forever reaching apt mirrors (Docker Desktop) | The experimental **Host networking** toggle blocks the build network. | Toggle Host networking **off** to build, back on to run. |

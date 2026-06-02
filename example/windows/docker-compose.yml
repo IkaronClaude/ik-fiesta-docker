@@ -20,7 +20,7 @@
 #   * Built images: fiesta-server-runtime:latest, fiesta-sql-runtime:latest,
 #     fiesta-proxy:latest. See ../README.md "Build" for the commands.
 #   * .env next to this file (copy .env.example).
-#   * Your ServerSource tree pointed to by FIESTA_SERVER in .env.
+#   * Your server files tree pointed to by FIESTA_SERVER in .env.
 #   * (Optional) GamigoZR crypt blob at ./gamigozr-blob/response.txt.
 #   * (Optional) XOR table at ./xor/xor.hex (or XOR_TABLE_HEX in .env).
 #

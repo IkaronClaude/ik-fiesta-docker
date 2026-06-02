@@ -4,7 +4,7 @@
 # server-side rationale.
 #
 # Why this exists:
-#   GamigoZR.exe is a 15 KB anti-cheat/version-stamp HTTP service that
+#   GamigoZR.exe is a 15 KB version-stamp HTTP service that
 #   every Zone process queries once at boot. The response is a static
 #   ~2.7 KB blob keyed off the operator's region; the .exe doesn't
 #   actually do any per-request computation. Running it under Wine in

@@ -11,7 +11,7 @@
 #     fiesta-sql-runtime:latest (Dockerfile.sql.linux),
 #     fiesta-proxy:latest (lib/fiesta-proxy/Dockerfile).
 #   * .env next to this file (copy .env.example).
-#   * Your ServerSource tree pointed to by FIESTA_SERVER in .env.
+#   * Your server files tree pointed to by FIESTA_SERVER in .env.
 #
 # Then:
 #   docker compose up -d

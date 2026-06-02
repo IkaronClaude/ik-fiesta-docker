@@ -620,7 +620,7 @@ wine reg add 'HKLM\Software\Wow6432Node\GBO' /v Sabana   /d 2554545953 /f 2>/dev
 # Warm up Wine's SCM -- first invocation spawns services.exe and is slow.
 wine sc.exe query type= service state= all 2>/dev/null || true
 
-# --- Step 3: Optionally start GamigoZR (anti-cheat) for Zone processes ---
+# --- Step 3: Optionally start GamigoZR for Zone processes ---
 should_start_gamigozr() {
     case "${START_GAMIGOZR}" in
         1)    return 0 ;;
