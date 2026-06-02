@@ -24,12 +24,31 @@ The images ship **no game files**. You supply:
    ├── Zone00/Zone.exe … Zone04/Zone.exe
    └── Databases/                your *.bak files (restored on first SQL boot)
    ```
-2. **A GamigoZR crypt blob** (`response.txt`) — only needed for the Zone exe,
-   which serves it to clients. Extract it once from a real GamigoZR
-   (`curl http://127.0.0.1:58492/ > response.txt`; recipe in
-   `Dockerfile.gamigozr-stub`). The real `GamigoZR.exe` itself isn't needed.
-3. **The XOR cipher table** — the c2s packet cipher. Required. Drop your
-   table into `xor/` and point `XOR_TABLE_PATH` (or `XOR_TABLE_HEX`) at it.
+2. **A GamigoZR crypt blob** (`response.txt`) — only needed by the Zone exe,
+   which queries GamigoZR once at boot. Drop it in `gamigozr-blob/`; the in-zone
+   stub replays it. The real `GamigoZR.exe` isn't needed at runtime — but you do
+   need it **once** to extract the blob:
+
+   ```bash
+   # Run a real GamigoZR.exe so it listens on 127.0.0.1:58492, then request the
+   # EXACT path the Zone uses (the path matters — '/' alone won't return it):
+   curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<your-pw>&world=0&machine=Zone1" > response.txt
+   ```
+   `title`/`nation`/`pw` come from your server build; `world`/`machine` per zone.
+   (To discover your exact request, point a Zone at a logging server on `:58492`
+   and read what it asks for.)
+3. **The XOR cipher table** — the c2s packet cipher. Required. Drop a file in
+   `xor/` and point `XOR_TABLE_PATH` (or pass `XOR_TABLE_HEX`) at it. Accepted
+   formats — hex parsing tolerates spaces, commas and `0x`:
+
+   ```ini
+   # inline (env)                         # made-up bytes — use your build's table
+   XOR_TABLE_HEX=A3 1F 00 C4 7E 9B 2D 55
+   XOR_TABLE_HEX=a31f00c47e9b2d55          # bare hex
+   XOR_TABLE_HEX=0xA3,0x1F,0x00,0xC4       # 0x + commas
+   # file (XOR_TABLE_PATH): the same hex as text, OR the raw binary table dumped
+   #   to a file. Length isn't fixed — it just has to match your client's table.
+   ```
 
 You also choose **`PUBLIC_IP`** — the address your players actually connect
 to (LAN IP, WAN/forwarded IP, or `127.0.0.1` for a local-only test).

@@ -138,13 +138,42 @@ This is just your standard Fiesta server files, mountable unmodified. (No
 
 ### GamigoZR
 
-GamigoZR is **only relevant to the Zone exe** — Zone clients fetch a crypt blob
-from it on connect. The original .NET `GamigoZR.exe` is **not required and
-generally won't function properly** in this setup. Instead,
-**ship your own GamigoZR crypt blob** (`response.txt`, extracted once from a real
-GamigoZR): the runtime serves it to Zone clients from a tiny baked-in HTTP stub
+GamigoZR is **only relevant to the Zone exe**, which queries it once at boot. The
+original .NET `GamigoZR.exe` is **not required and generally won't function
+properly** in this setup. Instead, **ship your own GamigoZR crypt blob**
+(`response.txt`): the runtime serves it from a tiny baked-in HTTP stub
 (`127.0.0.1:58492`), gated on `START_GAMIGOZR`/`CRYPT_BLOB_PATH`. No GamigoZR
-container or `.exe` needed.
+container or `.exe` needed at runtime.
+
+**Extracting the blob (one-shot, needs a real GamigoZR once):** run a real
+`GamigoZR.exe` so it listens on `127.0.0.1:58492`, then request the **exact path**
+a Zone uses — the real service is path/param-specific, so `/` alone won't return
+it. The Zone's boot request looks like:
+
+```bash
+curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<your-pw>&world=0&machine=Zone1" > response.txt
+```
+
+`title`/`nation`/`pw` come from your server build; `world`/`machine` are per
+zone. To discover your exact request, point a Zone at a logging HTTP server on
+`:58492` and read what it asks for. The stub then replays that one blob for every
+request (each Zone asks the same fixed URL).
+
+### XOR cipher table
+
+The client↔server (c2s) packets are XOR'd with a fixed, build-specific table the
+proxy needs (bring-your-own — none ships here). Supply it as inline hex
+(`XOR_TABLE_HEX`) or a file (`XOR_TABLE_PATH` — hex text **or** raw binary). Hex
+parsing tolerates spaces, commas and `0x`:
+
+```ini
+XOR_TABLE_HEX=A3 1F 00 C4 7E 9B 2D 55     # spaces  (bytes are made-up)
+XOR_TABLE_HEX=a31f00c47e9b2d55             # bare hex
+XOR_TABLE_HEX=0xA3,0x1F,0x00,0xC4          # 0x + commas
+```
+
+The length isn't fixed by the tooling (the cipher wraps mod the table length) —
+it just has to be the same table your client uses.
 
 ## What the entrypoint rewrites
 

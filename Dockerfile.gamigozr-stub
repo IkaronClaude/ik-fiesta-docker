@@ -14,9 +14,16 @@
 # How to extract the blob from a real GamigoZR (one-shot per region):
 #   1. Run the operator's GamigoZR.exe (Windows host or in a Wine
 #      container) so it listens on 127.0.0.1:58492.
-#   2. curl http://127.0.0.1:58492/ > response.txt
-#      Any URL works; the response is URL-agnostic.
-#   3. Save response.txt next to your compose file (or wherever).
+#   2. Request the EXACT path a Zone uses at boot (the real GamigoZR is
+#      path/param-specific -- '/' alone won't return the blob). Observed:
+#        GET /GR.php?act=boot&title=<TITLE>&nation=<NATION>&pw=<PW>&world=<W>&machine=<ZONE>
+#      e.g.:
+#        curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<PW>&world=0&machine=Zone1" > response.txt
+#      (title/nation/pw are per-build; world/machine per zone. To find yours,
+#       point a Zone at a logging server on :58492 and read its request.)
+#   3. Save response.txt next to your compose file (or wherever). This stub
+#      replays it for every request, which is fine since each Zone asks the
+#      same fixed URL.
 #
 # How to run:
 #   docker run --rm --network host \
