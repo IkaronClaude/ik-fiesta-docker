@@ -33,7 +33,10 @@ $keepAlive     = $env:KEEP_ALIVE -eq '1'
 # restart policy reconnects. Opt out with DB_AUTORESTART=0.
 $dbAutoRestart = $env:DB_AUTORESTART -ne '0'
 $dbAutoRestartPattern = if ($env:DB_AUTORESTART_PATTERN) { $env:DB_AUTORESTART_PATTERN } else {
-    'Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed'
+    # FreeTDS prefix (Linux/Wine) covers both "S1000 Unknown error" and
+    # "08S01 Communication link failure"; the rest are driver-agnostic
+    # connection phrases. Brackets escaped for regex.
+    '\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed'
 }
 $publicIp      = $env:PUBLIC_IP
 $sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.0.1' }
@@ -799,7 +802,9 @@ while ($true) {
         # logs are cleaned at startup, so any match is from this run; only DB
         # bridges emit these, so it's a no-op for Login/WM/Zone/proxy.
         if ($dbAutoRestart) {
-            $hit = Get-ChildItem $processDir -Filter 'Msg_*.txt' -ErrorAction SilentlyContinue |
+            # Bridges write Msg logs to $logDir (PROCESS_DIR\DebugMessage), not
+            # directly in $processDir -- scan both.
+            $hit = Get-ChildItem @($processDir, $logDir) -Filter 'Msg_*.txt' -ErrorAction SilentlyContinue |
                    Select-String -Pattern $dbAutoRestartPattern -List -ErrorAction SilentlyContinue |
                    Select-Object -First 1
             if ($hit) {

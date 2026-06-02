@@ -33,7 +33,13 @@ set -eo pipefail
 # serving while the container still looks healthy. We tear the service down on
 # that pattern so the restart policy reconnects. Opt out with DB_AUTORESTART=0.
 : "${DB_AUTORESTART:=1}"
-: "${DB_AUTORESTART_PATTERN:=Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed}"
+# The bridge logs its DB errors via the ODBC driver. On Linux/Wine that's
+# FreeTDS, whose error string is prefixed "[FreeTDS][SQL Server]" -- and a
+# dropped connection is reported mostly as the generic "S1000 ... Unknown
+# error", only sometimes as "08S01 ... Communication link failure". So match
+# the FreeTDS prefix (covers both) plus driver-agnostic connection phrases
+# (Windows {SQL Server} driver, unixODBC, etc.). Brackets are escaped for ERE.
+: "${DB_AUTORESTART_PATTERN:=\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed}"
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
@@ -848,11 +854,13 @@ TAIL_PID=$!
 if [ "${DB_AUTORESTART}" = "1" ]; then
     (
         while live_service_pids > /dev/null; do
+            # Bridges write their Msg log to PROCESS_DIR/DebugMessage/ (= LOG_DIR),
+            # not directly in PROCESS_DIR -- scan both, plus stdout.
             if grep -qhE -- "${DB_AUTORESTART_PATTERN}" \
-                "${PROCESS_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then
-                echo "=== DB connection lost (FreeTDS link failure) -- restarting container to reconnect to SQL ==="
+                "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then
+                echo "=== DB connection lost (FreeTDS/ODBC link failure) -- restarting container to reconnect to SQL ==="
                 grep -hE -- "${DB_AUTORESTART_PATTERN}" \
-                    "${PROCESS_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null \
+                    "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null \
                     | tail -2 | sed 's/^/    /'
                 kill $(live_service_pids 2>/dev/null) 2>/dev/null || true
                 break
