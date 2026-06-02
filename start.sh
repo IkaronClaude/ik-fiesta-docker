@@ -81,7 +81,6 @@ cleanup() {
     [ -n "${S2S_PROXY_PID:-}" ] && kill "${S2S_PROXY_PID}" 2>/dev/null || true
     [ -n "${NGINX_PID:-}" ]     && kill "${NGINX_PID}"     2>/dev/null || true
     [ -n "${TAIL_PID:-}" ]      && kill "${TAIL_PID}"      2>/dev/null || true
-    [ -n "${DB_WATCH_PID:-}" ]  && kill "${DB_WATCH_PID}"  2>/dev/null || true
     wineserver -k 2>/dev/null || true
     # Catch-all for any remaining direct children (Xvfb, stray tail -F).
     pkill -P $$ 2>/dev/null || true
@@ -841,42 +840,34 @@ echo "Tailing logs in ${PROCESS_DIR} and ${LOG_DIR}..."
 ) &
 TAIL_PID=$!
 
-# --- Step 5b: DB-bridge auto-restart watcher ---
-# A DB bridge that loses its SQL connection keeps running (so the container
-# looks healthy) but logs a FreeTDS connection-link failure on every query and
-# stops serving -- logins fail downstream. The exe never reconnects, so we
-# watch its logs for that pattern and, on a match, kill the service: Step 6's
-# wait loop then ends, the script exits non-zero, and the restart policy
-# (compose restart: on-failure / k8s restartPolicy) recreates the container
-# with a fresh DB handle. Stale logs are cleaned at startup (see above), so any
-# match here is from THIS run. Only DB bridges use FreeTDS, so this is a no-op
-# for Login/WM/Zone/proxy. Opt out with DB_AUTORESTART=0.
-if [ "${DB_AUTORESTART}" = "1" ]; then
-    (
-        while live_service_pids > /dev/null; do
-            # Bridges write their Msg log to PROCESS_DIR/DebugMessage/ (= LOG_DIR),
-            # not directly in PROCESS_DIR -- scan both, plus stdout.
-            if grep -qhE -- "${DB_AUTORESTART_PATTERN}" \
-                "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then
-                echo "=== DB connection lost (FreeTDS/ODBC link failure) -- restarting container to reconnect to SQL ==="
-                grep -hE -- "${DB_AUTORESTART_PATTERN}" \
-                    "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null \
-                    | tail -2 | sed 's/^/    /'
-                kill $(live_service_pids 2>/dev/null) 2>/dev/null || true
-                break
-            fi
-            sleep 5
-        done
-    ) &
-    DB_WATCH_PID=$!
-fi
-
-# --- Step 6: Wait for the process to die ---
+# --- Step 6: Wait for the process to die (or for a DB-connection failure) ---
 # Use live_service_pids (matches the full Wine path Z:\server\...\X.exe and
 # strips zombies), NOT a loose pgrep -f "${PROCESS_EXE}" -- the latter would
 # also match start.sh's own argv (the exe name is $1) and never return false,
 # leaving the container running forever after the service has already died.
+#
+# DB-bridge auto-restart: a bridge that loses its SQL connection keeps running
+# (so the container looks healthy) but logs a FreeTDS/ODBC link failure on every
+# query and stops serving -- logins fail downstream. The exe never reconnects,
+# so on that pattern we break out of the wait and fall through to the normal
+# exit below; the restart policy (compose restart: on-failure / k8s
+# restartPolicy) then recreates the container with a fresh DB handle. Detection
+# runs HERE in the main loop, NOT in a background watcher: a backgrounded
+# subshell can't terminate the Wine service reliably (the exe ignores SIGTERM,
+# which left the container running in testing), whereas breaking here drives
+# start.sh's own exit path. Bridges write Msg logs under DebugMessage/
+# (= LOG_DIR), so scan that and PROCESS_DIR (+ stdout). Stale logs are cleaned at
+# startup, so any match is from THIS run; only DB bridges use ODBC/FreeTDS, so
+# it's a no-op for Login/WM/Zone/proxy. Opt out with DB_AUTORESTART=0.
 while live_service_pids > /dev/null; do
+    if [ "${DB_AUTORESTART}" = "1" ] && grep -qhE -- "${DB_AUTORESTART_PATTERN}" \
+        "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then
+        echo "=== DB connection lost (FreeTDS/ODBC link failure) -- exiting so the restart policy reconnects to SQL ==="
+        grep -hE -- "${DB_AUTORESTART_PATTERN}" \
+            "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null \
+            | tail -2 | sed 's/^/    /'
+        break
+    fi
     sleep 5
 done
 
