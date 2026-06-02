@@ -138,9 +138,9 @@ This is just your standard Fiesta server files, mountable unmodified. (No
 
 ### GamigoZR
 
-GamigoZR is **not an anti-cheat** and is **only relevant to the Zone exe** (Zone
-clients fetch a crypt blob from it on connect). The original .NET `GamigoZR.exe`
-is **not required and generally won't function properly** in this setup. Instead,
+GamigoZR is **only relevant to the Zone exe** — Zone clients fetch a crypt blob
+from it on connect. The original .NET `GamigoZR.exe` is **not required and
+generally won't function properly** in this setup. Instead,
 **ship your own GamigoZR crypt blob** (`response.txt`, extracted once from a real
 GamigoZR): the runtime serves it to Zone clients from a tiny baked-in HTTP stub
 (`127.0.0.1:58492`), gated on `START_GAMIGOZR`/`CRYPT_BLOB_PATH`. No GamigoZR
@@ -310,8 +310,8 @@ the SQL and proxy images.
   `9Data/SubAbStateClass.txt`).
 - **Windows bind mounts are directory-only.** Isolate a single file by giving it
   its own directory.
-- **GamigoZR**: not an anti-cheat, only relevant to Zones; ship your own crypt
-  blob (`response.txt`) — the real `.exe` isn't needed and won't work here.
+- **GamigoZR**: only relevant to Zones; ship your own crypt blob (`response.txt`)
+  — the real `.exe` isn't needed and won't work here.
 - **Linux Wine prefix is pre-initialised** at build time; first-run cost is paid
   once, not per container start.
 
