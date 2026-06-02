@@ -44,4 +44,4 @@ EXPOSE 58492
 
 LABEL org.opencontainers.image.title="fiesta-gamigozr-stub" \
       org.opencontainers.image.description="nginx stub for Fiesta Online's GamigoZR zone-response HTTP service. Operator supplies the crypt blob; ships no copyrighted data." \
-      org.opencontainers.image.source="https://github.com/IkaronClaude/fiesta-docker"
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ik-fiesta-docker"

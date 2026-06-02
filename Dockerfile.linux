@@ -140,6 +140,6 @@ EXPOSE 9010 9013 9016 9019 9022 9025 9028
 
 LABEL org.opencontainers.image.title="fiesta-server-runtime" \
       org.opencontainers.image.description="Bring-your-own runtime for Fiesta Online server binaries (Wine on Linux)" \
-      org.opencontainers.image.source="https://github.com/IkaronClaude/fiesta-docker"
+      org.opencontainers.image.source="https://github.com/IkaronClaude/ik-fiesta-docker"
 
 ENTRYPOINT ["/usr/local/bin/start.sh"]

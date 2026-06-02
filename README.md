@@ -1,4 +1,4 @@
-# fiesta-docker — BYO runtime container for Fiesta Online servers
+# ik-fiesta-docker — BYO runtime container for Fiesta Online servers
 
 A generic container image for running a Fiesta Online server process
 (`Login.exe`, `Zone.exe`, `Account.exe`, ...). The image ships **no game
