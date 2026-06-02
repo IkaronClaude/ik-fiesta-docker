@@ -36,8 +36,10 @@ The images ship **no game files**. You supply:
    ```
    `title`/`nation` come from your server build and `world`/`machine` are per
    zone. `pw` looks like a constant baked into the Zone exe (not a password you
-   set) — just reuse whatever your zone sends. (To discover your exact request,
-   point a Zone at a logging server on `:58492` and read what it asks for.)
+   set) — and many GamigoZR builds don't even validate it (the response is a
+   static blob), so its exact value usually doesn't matter; just reuse what your
+   zone sends. (To discover your exact request, point a Zone at a logging server
+   on `:58492` and read what it asks for.)
 3. **The XOR cipher table** — the c2s packet cipher. Required. Drop a file in
    `xor/` and point `XOR_TABLE_PATH` (or pass `XOR_TABLE_HEX`) at it. Accepted
    formats — hex parsing tolerates spaces, commas and `0x`:
