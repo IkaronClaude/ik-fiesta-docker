@@ -15,6 +15,8 @@
 #   GAMIGOZR_DIR      subdir under FIESTA_PATH (default: GamigoZR)
 #   SERVICE_NAME      override Wine SCM service name (default: _<dirname>)
 #   KEEP_ALIVE        1 -> keep container alive after process exits
+#   DB_AUTORESTART    1 -> exit (so the restart policy reconnects) when a DB
+#                     bridge logs a FreeTDS connection-link failure (default 1)
 
 set -eo pipefail
 
@@ -24,6 +26,14 @@ set -eo pipefail
 : "${IS_ZONE:=auto}"
 : "${CRYPT_BLOB_PATH:=/etc/gamigozr/response.txt}"
 : "${KEEP_ALIVE:=0}"
+# DB-bridge auto-restart on a lost SQL connection. Fiesta DB bridges open ONE
+# long-lived ODBC/FreeTDS connection at boot and never re-establish it if SQL
+# drops (e.g. the SQL pod is rescheduled after the bridge connected). The
+# bridge then logs FreeTDS connection-link failures on every query and stops
+# serving while the container still looks healthy. We tear the service down on
+# that pattern so the restart policy reconnects. Opt out with DB_AUTORESTART=0.
+: "${DB_AUTORESTART:=1}"
+: "${DB_AUTORESTART_PATTERN:=Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed}"
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
@@ -65,6 +75,7 @@ cleanup() {
     [ -n "${S2S_PROXY_PID:-}" ] && kill "${S2S_PROXY_PID}" 2>/dev/null || true
     [ -n "${NGINX_PID:-}" ]     && kill "${NGINX_PID}"     2>/dev/null || true
     [ -n "${TAIL_PID:-}" ]      && kill "${TAIL_PID}"      2>/dev/null || true
+    [ -n "${DB_WATCH_PID:-}" ]  && kill "${DB_WATCH_PID}"  2>/dev/null || true
     wineserver -k 2>/dev/null || true
     # Catch-all for any remaining direct children (Xvfb, stray tail -F).
     pkill -P $$ 2>/dev/null || true
@@ -823,6 +834,34 @@ echo "Tailing logs in ${PROCESS_DIR} and ${LOG_DIR}..."
     done
 ) &
 TAIL_PID=$!
+
+# --- Step 5b: DB-bridge auto-restart watcher ---
+# A DB bridge that loses its SQL connection keeps running (so the container
+# looks healthy) but logs a FreeTDS connection-link failure on every query and
+# stops serving -- logins fail downstream. The exe never reconnects, so we
+# watch its logs for that pattern and, on a match, kill the service: Step 6's
+# wait loop then ends, the script exits non-zero, and the restart policy
+# (compose restart: on-failure / k8s restartPolicy) recreates the container
+# with a fresh DB handle. Stale logs are cleaned at startup (see above), so any
+# match here is from THIS run. Only DB bridges use FreeTDS, so this is a no-op
+# for Login/WM/Zone/proxy. Opt out with DB_AUTORESTART=0.
+if [ "${DB_AUTORESTART}" = "1" ]; then
+    (
+        while live_service_pids > /dev/null; do
+            if grep -qhE -- "${DB_AUTORESTART_PATTERN}" \
+                "${PROCESS_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then
+                echo "=== DB connection lost (FreeTDS link failure) -- restarting container to reconnect to SQL ==="
+                grep -hE -- "${DB_AUTORESTART_PATTERN}" \
+                    "${PROCESS_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null \
+                    | tail -2 | sed 's/^/    /'
+                kill $(live_service_pids 2>/dev/null) 2>/dev/null || true
+                break
+            fi
+            sleep 5
+        done
+    ) &
+    DB_WATCH_PID=$!
+fi
 
 # --- Step 6: Wait for the process to die ---
 # Use live_service_pids (matches the full Wine path Z:\server\...\X.exe and

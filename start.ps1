@@ -15,6 +15,8 @@
 #   GAMIGOZR_DIR      subdir under FIESTA_PATH (default: GamigoZR)
 #   SERVICE_NAME      override service name (default: _<dirname>)
 #   KEEP_ALIVE        1 -> keep container alive after process exits
+#   DB_AUTORESTART    1 -> exit (so the restart policy reconnects) when a DB
+#                     bridge logs a FreeTDS connection-link failure (default 1)
 
 $ErrorActionPreference = 'Continue'
 
@@ -23,6 +25,16 @@ $fiestaExe     = $env:FIESTA_EXE
 $startGamigoZR = if ($env:START_GAMIGOZR) { $env:START_GAMIGOZR } else { 'auto' }
 $gamigoZRDir   = if ($env:GAMIGOZR_DIR)   { $env:GAMIGOZR_DIR }   else { 'GamigoZR' }
 $keepAlive     = $env:KEEP_ALIVE -eq '1'
+# DB-bridge auto-restart on a lost SQL connection. Fiesta DB bridges open ONE
+# long-lived ODBC connection at boot and never re-establish it if SQL drops
+# (e.g. the SQL container is rescheduled after the bridge connected). The
+# bridge then logs a connection-link failure on every query and stops serving
+# while the container still looks healthy. We exit on that pattern so the
+# restart policy reconnects. Opt out with DB_AUTORESTART=0.
+$dbAutoRestart = $env:DB_AUTORESTART -ne '0'
+$dbAutoRestartPattern = if ($env:DB_AUTORESTART_PATTERN) { $env:DB_AUTORESTART_PATTERN } else {
+    'Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed'
+}
 $publicIp      = $env:PUBLIC_IP
 $sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.0.1' }
 $sqlPort       = if ($env:SQL_PORT)       { $env:SQL_PORT }       else { '1433' }
@@ -779,6 +791,35 @@ while ($true) {
     $svcCheckTick++
     if ($svcCheckTick -ge 5) {
         $svcCheckTick = 0
+
+        # DB bridge lost its SQL connection? It keeps running but logs a
+        # FreeTDS connection-link failure on every query and stops serving
+        # (logins fail downstream). The exe never reconnects, so exit and let
+        # the restart policy recreate the container with a fresh handle. Stale
+        # logs are cleaned at startup, so any match is from this run; only DB
+        # bridges emit these, so it's a no-op for Login/WM/Zone/proxy.
+        if ($dbAutoRestart) {
+            $hit = Get-ChildItem $processDir -Filter 'Msg_*.txt' -ErrorAction SilentlyContinue |
+                   Select-String -Pattern $dbAutoRestartPattern -List -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+            if ($hit) {
+                Write-Host "=== DB connection lost (FreeTDS link failure) -- restarting container to reconnect to SQL ===" -ForegroundColor Yellow
+                Write-Host ("    {0}" -f $hit.Line.Trim())
+                for ($d = 0; $d -lt 10; $d++) {
+                    Start-Sleep -Milliseconds 500
+                    foreach ($job in $jobs) {
+                        Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                    }
+                }
+                if ($keepAlive) {
+                    Write-Host "KEEP_ALIVE=1: container staying alive." -ForegroundColor Cyan
+                    while ($true) { Start-Sleep -Seconds 60 }
+                }
+                Invoke-Cleanup
+                exit 1
+            }
+        }
+
         $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -eq 'Running') { $svcSeenRunning = $true }
 
