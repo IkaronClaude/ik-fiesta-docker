@@ -34,9 +34,10 @@ The images ship **no game files**. You supply:
    # EXACT path the Zone uses (the path matters — '/' alone won't return it):
    curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<your-pw>&world=0&machine=Zone1" > response.txt
    ```
-   `title`/`nation`/`pw` come from your server build; `world`/`machine` per zone.
-   (To discover your exact request, point a Zone at a logging server on `:58492`
-   and read what it asks for.)
+   `title`/`nation` come from your server build and `world`/`machine` are per
+   zone. `pw` looks like a constant baked into the Zone exe (not a password you
+   set) — just reuse whatever your zone sends. (To discover your exact request,
+   point a Zone at a logging server on `:58492` and read what it asks for.)
 3. **The XOR cipher table** — the c2s packet cipher. Required. Drop a file in
    `xor/` and point `XOR_TABLE_PATH` (or pass `XOR_TABLE_HEX`) at it. Accepted
    formats — hex parsing tolerates spaces, commas and `0x`:

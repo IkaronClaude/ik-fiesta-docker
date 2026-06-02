@@ -154,9 +154,10 @@ it. The Zone's boot request looks like:
 curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<your-pw>&world=0&machine=Zone1" > response.txt
 ```
 
-`title`/`nation`/`pw` come from your server build; `world`/`machine` are per
-zone. To discover your exact request, point a Zone at a logging HTTP server on
-`:58492` and read what it asks for. The stub then replays that one blob for every
+`title`/`nation` come from your server build and `world`/`machine` are per zone.
+`pw` appears to be a constant compiled into the Zone exe (not a password you set),
+so just reuse whatever your zone sends. To discover your exact request, point a
+Zone at a logging HTTP server on `:58492` and read what it asks for. The stub then replays that one blob for every
 request (each Zone asks the same fixed URL).
 
 ### XOR cipher table

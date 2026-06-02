@@ -19,8 +19,9 @@
 #        GET /GR.php?act=boot&title=<TITLE>&nation=<NATION>&pw=<PW>&world=<W>&machine=<ZONE>
 #      e.g.:
 #        curl "http://127.0.0.1:58492/GR.php?act=boot&title=Fiesta&nation=EU_US_REAL&pw=<PW>&world=0&machine=Zone1" > response.txt
-#      (title/nation/pw are per-build; world/machine per zone. To find yours,
-#       point a Zone at a logging server on :58492 and read its request.)
+#      (title/nation per-build; world/machine per zone. pw looks like a constant
+#       compiled into the Zone exe, not a real password -- reuse what your zone
+#       sends. To find yours, point a Zone at a logging server on :58492.)
 #   3. Save response.txt next to your compose file (or wherever). This stub
 #      replays it for every request, which is fine since each Zone asks the
 #      same fixed URL.
