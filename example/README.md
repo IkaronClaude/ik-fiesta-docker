@@ -40,6 +40,18 @@ The images ship **no game files**. You supply:
    static blob), so its exact value usually doesn't matter; just reuse what your
    zone sends. (To discover your exact request, point a Zone at a logging server
    on `:58492` and read what it asks for.)
+
+   > **Heads-up:** depending on the build, `GamigoZR.exe` is often a *Windows
+   > service stub* — run it directly and it just pops a *"cannot start service
+   > from command line"* dialog and binds nothing. If yours does that, install
+   > and start it as a service first, then curl:
+   > ```bat
+   > sc create GamigoZR binPath= "C:\path\to\GamigoZR.exe" start= demand
+   > sc start  GamigoZR
+   > ```
+   > (`sc`-installing the Fiesta services is routine, so this won't surprise a
+   > seasoned operator — but it's easy to miss on a first/AI-assisted setup.)
+   > Some builds run as a plain console app instead; those need no service.
 3. **The XOR cipher table** — the c2s packet cipher. Required. Drop a file in
    `xor/` and point `XOR_TABLE_PATH` (or pass `XOR_TABLE_HEX`) at it. Accepted
    formats — hex parsing tolerates spaces, commas and `0x`:
@@ -80,6 +92,12 @@ docker compose up -d
 docker compose logs -f login
 ```
 
+> **Windows only:** create the SQL data dir **before** the first `up` —
+> `mkdir sql-data`. Windows containers don't auto-create bind-mount source
+> directories (Linux does), so without it the `sqlserver` container fails to
+> create with *"bind source path does not exist"*. (The Linux example uses a
+> named volume, so this only bites the Windows stack.)
+
 Point a Fiesta client at `PUBLIC_IP:9010`. That's it — the Linux example
 pulls `ikaronclaude/fiesta-*:latest`; the Windows example does too (multi-arch).
 
@@ -101,6 +119,12 @@ docker compose exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa \
   "INSERT INTO tUser (sUserID,sUserPW,sUserName,sUserIP) VALUES \
    ('testuser', UPPER(CONVERT(varchar(32), HASHBYTES('MD5','test123'), 2)), 'Test','127.0.0.1')"
 ```
+
+> **Windows stack:** the bundled SQL image ships `sqlcmd` on `PATH` (not at the
+> Linux `/opt/mssql-tools18/...` path), so just call `sqlcmd` directly:
+> ```powershell
+> docker compose exec sqlserver sqlcmd -S localhost -U sa -P "%SA_PASSWORD%" -C -d Account -Q "INSERT INTO tUser (sUserID,sUserPW,sUserName,sUserIP) VALUES ('testuser', UPPER(CONVERT(varchar(32), HASHBYTES('MD5','test123'), 2)), 'Test','127.0.0.1')"
+> ```
 
 Down: `docker compose down` (data is safe — see [DB persistence](#database--sql-options)).
 
