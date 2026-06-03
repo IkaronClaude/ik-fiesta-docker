@@ -39,7 +39,17 @@ set -eo pipefail
 # error", only sometimes as "08S01 ... Communication link failure". So match
 # the FreeTDS prefix (covers both) plus driver-agnostic connection phrases
 # (Windows {SQL Server} driver, unixODBC, etc.). Brackets are escaped for ERE.
-: "${DB_AUTORESTART_PATTERN:=\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed}"
+#
+# A stale connection doesn't always surface as an ODBC line: the exe's
+# init-time bulk loads just fail at the app level. The Character bridge logs
+# "ERROR - CPFsCharacter::fc_NC_GUILD_DB_LIST_REQ" and the WorldManager logs
+# "FAILED - CGuildManager::Recv_NC_GUILD_DB_ALL_ACK" -- after which WM never
+# finishes init and the world stays "down for maintenance". These are
+# init-only bulk-guild-load failures (not per-player guild ops), and they're
+# anchored to ERROR/FAILED so normal guild traffic never trips them. Matching
+# them lets the Character bridge restart with a fresh handle AND lets WM
+# restart so it re-runs init once the bridge is healthy.
+: "${DB_AUTORESTART_PATTERN:=\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed|(ERROR|FAILED).*(fc_NC_GUILD_DB_LIST_REQ|Recv_NC_GUILD_DB_ALL_ACK)}"
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
@@ -857,8 +867,10 @@ TAIL_PID=$!
 # which left the container running in testing), whereas breaking here drives
 # start.sh's own exit path. Bridges write Msg logs under DebugMessage/
 # (= LOG_DIR), so scan that and PROCESS_DIR (+ stdout). Stale logs are cleaned at
-# startup, so any match is from THIS run; only DB bridges use ODBC/FreeTDS, so
-# it's a no-op for Login/WM/Zone/proxy. Opt out with DB_AUTORESTART=0.
+# startup, so any match is from THIS run. Only DB bridges use ODBC/FreeTDS
+# (no-op for Login/Zone/proxy); WorldManager additionally matches the
+# guild-load failure pattern on purpose, so it re-runs init once the Character
+# bridge is healthy. Opt out with DB_AUTORESTART=0.
 while live_service_pids > /dev/null; do
     if [ "${DB_AUTORESTART}" = "1" ] && grep -qhE -- "${DB_AUTORESTART_PATTERN}" \
         "${PROCESS_DIR}"/Msg_*.txt "${LOG_DIR}"/Msg_*.txt "${STDOUT_LOG}" 2>/dev/null; then

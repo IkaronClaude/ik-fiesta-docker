@@ -35,8 +35,13 @@ $dbAutoRestart = $env:DB_AUTORESTART -ne '0'
 $dbAutoRestartPattern = if ($env:DB_AUTORESTART_PATTERN) { $env:DB_AUTORESTART_PATTERN } else {
     # FreeTDS prefix (Linux/Wine) covers both "S1000 Unknown error" and
     # "08S01 Communication link failure"; the rest are driver-agnostic
-    # connection phrases. Brackets escaped for regex.
-    '\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed'
+    # connection phrases. Brackets escaped for regex. The trailing alternative
+    # catches the init-time bulk-guild-load failures a stale connection causes
+    # at the app level -- Character bridge "ERROR - ...fc_NC_GUILD_DB_LIST_REQ"
+    # and WorldManager "FAILED - ...Recv_NC_GUILD_DB_ALL_ACK" -- so the bridge
+    # restarts with a fresh handle and WM re-runs init (anchored to ERROR/FAILED
+    # so normal guild traffic never trips it).
+    '\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed|(ERROR|FAILED).*(fc_NC_GUILD_DB_LIST_REQ|Recv_NC_GUILD_DB_ALL_ACK)'
 }
 $publicIp      = $env:PUBLIC_IP
 $sqlHost       = if ($env:SQL_HOST)       { $env:SQL_HOST }       else { '127.0.0.1' }
