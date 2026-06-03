@@ -33,12 +33,14 @@ set -eo pipefail
 # serving while the container still looks healthy. We tear the service down on
 # that pattern so the restart policy reconnects. Opt out with DB_AUTORESTART=0.
 : "${DB_AUTORESTART:=1}"
-# The bridge logs its DB errors via the ODBC driver. On Linux/Wine that's
-# FreeTDS, whose error string is prefixed "[FreeTDS][SQL Server]" -- and a
-# dropped connection is reported mostly as the generic "S1000 ... Unknown
-# error", only sometimes as "08S01 ... Communication link failure". So match
-# the FreeTDS prefix (covers both) plus driver-agnostic connection phrases
-# (Windows {SQL Server} driver, unixODBC, etc.). Brackets are escaped for ERE.
+# Match ONLY genuine connection-loss phrases -- NOT the bare "[FreeTDS][SQL
+# Server]" prefix. That prefix also fronts ordinary app-level errors (e.g.
+# "Could not find stored procedure", error 2812; constraint violations), so
+# matching it falsely restarts a HEALTHY bridge mid-game whenever the exe calls
+# a missing proc -- turning one failed feature into a full bridge bounce that
+# drops every connected player. A genuinely dropped connection instead surfaces
+# as one of the driver-agnostic phrases below (08S01 comm-link failure,
+# read/write-to-server failed, connect/login failure).
 #
 # A stale connection doesn't always surface as an ODBC line: the exe's
 # init-time bulk loads just fail at the app level. The Character bridge logs
@@ -49,7 +51,7 @@ set -eo pipefail
 # anchored to ERROR/FAILED so normal guild traffic never trips them. Matching
 # them lets the Character bridge restart with a fresh handle AND lets WM
 # restart so it re-runs init once the bridge is healthy.
-: "${DB_AUTORESTART_PATTERN:=\[FreeTDS\]\[SQL Server\]|Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed|(ERROR|FAILED).*(fc_NC_GUILD_DB_LIST_REQ|Recv_NC_GUILD_DB_ALL_ACK)}"
+: "${DB_AUTORESTART_PATTERN:=Communication link failure|Unable to connect to data source|Login timeout expired|Adaptive Server connection failed|Write to the server failed|Read from the server failed|(ERROR|FAILED).*(fc_NC_GUILD_DB_LIST_REQ|Recv_NC_GUILD_DB_ALL_ACK)}"
 : "${SQL_HOST:=127.0.0.1}"
 : "${SQL_PORT:=1433}"
 : "${ODBC_DRIVER:=SQL Server}"
