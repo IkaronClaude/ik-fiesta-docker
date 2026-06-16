@@ -75,6 +75,7 @@ services:
   # `docker compose up -d` brings it up. For external SQL: drop the profile
   # in .env, set SQL_HOST in .env, and the bridges talk to your DB directly.
   sqlserver:
+    container_name: sqlserver
     image: "${SQL_IMAGE:-ikaronclaude/fiesta-sql-runtime:latest}"
     profiles: ["bundled-sql"]
     restart: on-failure
@@ -98,6 +99,7 @@ services:
     # depends_on on that, otherwise bridges boot into a half-restored DB.
 
   account:
+    container_name: account
     <<: *fiesta
     command: ["Account/Account.exe"]
     environment:
@@ -113,6 +115,7 @@ services:
       sqlserver: { condition: service_healthy, required: false }
 
   accountlog:
+    container_name: accountlog
     <<: *fiesta
     command: ["AccountLog/AccountLog.exe"]
     environment:
@@ -128,6 +131,7 @@ services:
       sqlserver: { condition: service_healthy, required: false }
 
   character:
+    container_name: character
     <<: *fiesta
     command: ["Character/Character.exe"]
     environment:
@@ -143,6 +147,7 @@ services:
       sqlserver: { condition: service_healthy, required: false }
 
   gamelog:
+    container_name: gamelog
     <<: *fiesta
     command: ["GameLog/GameLog.exe"]
     environment:
@@ -158,6 +163,7 @@ services:
       sqlserver: { condition: service_healthy, required: false }
 
   login:
+    container_name: login
     <<: *fiesta
     command: ["Login/Login.exe"]
     environment:
@@ -173,6 +179,7 @@ services:
       gamelog:    { condition: service_started }
 
   worldmanager:
+    container_name: worldmanager
     <<: *fiesta
     command: ["WorldManager/WorldManager.exe"]
     environment:
@@ -198,6 +205,7 @@ services:
   # publishes a host port for each one.
 
   zone00:
+    container_name: zone00
     <<: *fiesta
     command: ["Zone00/Zone.exe"]
     environment:
@@ -215,6 +223,7 @@ services:
       worldmanager: { condition: service_started }
 
   zone01:
+    container_name: zone01
     <<: *fiesta
     command: ["Zone01/Zone.exe"]
     environment:
@@ -230,6 +239,7 @@ services:
       worldmanager: { condition: service_started }
 
   zone02:
+    container_name: zone02
     <<: *fiesta
     command: ["Zone02/Zone.exe"]
     environment:
@@ -245,6 +255,7 @@ services:
       worldmanager: { condition: service_started }
 
   zone03:
+    container_name: zone03
     <<: *fiesta
     command: ["Zone03/Zone.exe"]
     environment:
@@ -260,6 +271,7 @@ services:
       worldmanager: { condition: service_started }
 
   zone04:
+    container_name: zone04
     <<: *fiesta
     command: ["Zone04/Zone.exe"]
     environment:
@@ -284,6 +296,7 @@ services:
   # channel is the noisiest connection in the stack and carries no address
   # fields the proxy needs to touch, so it runs as a raw byte pump.
   proxy:
+    container_name: proxy
     image: "${PROXY_IMAGE:-ikaronclaude/fiesta-proxy:latest}"
     restart: on-failure
     environment:
