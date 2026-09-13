@@ -23,24 +23,36 @@ COPY lib/fiesta-proxy/lib/ lib/
 RUN dotnet publish src/FiestaProxy/FiestaProxy.csproj -c Release -o /proxy /p:UseAppHost=false
 
 # --- Stage 1b: patched 32-bit FreeTDS ODBC driver ---
-# Stock tdsodbc (1.3.x) truncates a variable-length param bound with ColumnSize=0
-# to a 0-byte value on the wire. Fiesta's character.exe binds the quest-progress
-# varbinary (p_Quest_Set @sData) that way, so in-progress quest kill-counts were
-# saved as empty 0x and lost on relog. Our sql2tds.c patch sizes the param from
-# the actual data length when ColumnSize==0 (matching MS ODBC Driver 17/18).
+# Stock tdsodbc (1.3.x) mishandles a variable-length param bound with ColumnSize=0
+# in BOTH directions. Fiesta's exes bind that way throughout -- the size is passed in
+# SQLBindParameter's DecimalDigits slot instead of ColumnSize. MS ODBC Driver 17/18
+# tolerate it; FreeTDS does not. One sql2tds.c patch per direction:
+#   columnsize0-varbinary.patch     INPUT params went out as a 0-byte value, so the
+#     quest-progress varbinary (p_Quest_Set @sData) was saved as empty 0x and
+#     in-progress kill-counts were lost on relog.
+#   output-param-columnsize0.patch  OUTPUT params were declared varbinary(1), so the
+#     server returned 1 byte and the caller's buffer kept its uninitialised contents.
+#     That broke every p_Char_GetOpt* read (window positions, shortcut-bar size,
+#     keymapping, video/sound/game), so client UI layout never survived a relog -- and
+#     Character.exe shipped 391 bytes of its own stack to the game client in the ACK.
 # Built i386 to match the 32-bit Wine server exes; overlaid in the runtime stage.
-FROM --platform=linux/386 i386/debian:bullseye AS freetds-build
+# bookworm, not bullseye: deb.debian.org/debian-security no longer serves the
+# bullseye i386 pool (every .deb 404s), so the bullseye build stage can't install
+# its toolchain any more. bookworm's glibc 2.36 is still well under the Ubuntu
+# 24.04 runtime stage's 2.39, so the i386 .so loads there unchanged.
+FROM --platform=linux/386 i386/debian:bookworm AS freetds-build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential autoconf automake libtool gperf pkg-config gettext \
+        build-essential autoconf automake libtool libltdl-dev gperf pkg-config gettext \
         unixodbc-dev ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /ft
-COPY freetds/columnsize0-varbinary.patch ./
+COPY freetds/columnsize0-varbinary.patch freetds/output-param-columnsize0.patch ./
 RUN git clone --depth 1 --branch v1.3.17 https://github.com/FreeTDS/freetds.git src \
     && cd src \
     && git apply ../columnsize0-varbinary.patch \
+    && git apply ../output-param-columnsize0.patch \
     && sh autogen.sh --disable-dependency-tracking --enable-odbc \
         --with-unixodbc=/usr --disable-apps --disable-server \
     # top-level make generates the include headers then builds the libs; the

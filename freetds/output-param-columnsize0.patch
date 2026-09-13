@@ -1,0 +1,33 @@
+--- a/src/odbc/sql2tds.c
++++ b/src/odbc/sql2tds.c
+@@ -237,6 +237,30 @@
+ 		if (dest_type != SYBUNIQUE && !is_fixed_type(dest_type)) {
+ 			curcol->column_cur_size = 0;
+ 			curcol->column_size = drec_ixd->sql_desc_length;
++			/* FreeTDS fork (Ikaron 2026-09-13): an OUTPUT / INPUT_OUTPUT param of a
++			 * VARIABLE-length type bound with ColumnSize 0 (SQLBindParameter arg 6 == 0)
++			 * must be declared to the server with the size of the bound buffer, not 0 --
++			 * that is what MS ODBC Driver 17/18 do. Stock FreeTDS left column_size at 0,
++			 * and tds_fix_column_size() then clamps a varint-2 type to MAX(MIN(0,8000),1)
++			 * == 1, so the RPC declared e.g. "@sData varbinary(1) OUTPUT". SQL Server duly
++			 * returned ONE byte; odbc_set_return_params() wrote that single byte into the
++			 * caller's buffer and left the rest untouched -- a caller that trusts the
++			 * declared struct size then reads (and, in Fiesta's case, transmits to clients)
++			 * uninitialised stack memory.
++			 * This is the read-side twin of the input-side ColumnSize 0 fix further down;
++			 * together they cover both directions. Fiesta's Character.exe hits this on every
++			 * p_Char_GetOpt* call (window positions, shortcut-bar size, keymapping, video /
++			 * sound / game blobs), which is why client UI layout never survived a relog.
++			 * Scoped to output params of variable-length char/binary C types. */
++			if (curcol->column_size == 0 && curcol->column_output
++			    && drec_axd->sql_desc_octet_length > 0
++			    && (sql_src_type == SQL_C_BINARY || sql_src_type == SQL_C_CHAR
++				|| sql_src_type == SQL_C_WCHAR)) {
++				SQLLEN buflen = drec_axd->sql_desc_octet_length;
++				if (sql_src_type == SQL_C_WCHAR)
++					buflen /= sizeof(SQLWCHAR);
++				curcol->column_size = (TDS_INT) buflen;
++			}
+ 			if (curcol->column_size < 0) {
+ 				curcol->on_server.column_size = curcol->column_size = 0x7FFFFFFFl;
+ 			} else {
