@@ -35,6 +35,8 @@ static long tick(void) {
     return tick_us;
 }
 
+static long long round_up(long long us, long t) { return (us + t - 1) / t * t; }
+
 int select(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval* tv) {
     static select_fn real;
     if (!real) real = (select_fn)dlsym(RTLD_NEXT, "select");
@@ -42,9 +44,31 @@ int select(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval* tv) {
     if (t && nfds == 0 && !r && !w && !e && tv) {
         long long us = (long long)tv->tv_sec * 1000000 + tv->tv_usec;
         if (us > 0) {
-            long long up = (us + t - 1) / t * t;
+            long long up = round_up(us, t);
             tv->tv_sec = (long)(up / 1000000);
             tv->tv_usec = (long)(up % 1000000);
+        }
+    }
+    return real(nfds, r, w, e, tv);
+}
+
+/* The i386 Wine on Ubuntu 24.04 is built with 64-bit time_t, and glibc then redirects select() to __select64,
+ * which takes a timeval with 64-bit fields - Wine's ntdll.so imports __select64, not select (checked 2026-09-25:
+ * the first build wrapped only select and changed nothing - Account.exe still did ~61,000 context switches/s). */
+struct timeval64 { long long tv_sec; long long tv_usec; };
+typedef int (*select64_fn)(int, fd_set*, fd_set*, fd_set*, struct timeval64*);
+
+int __select64(int nfds, fd_set* r, fd_set* w, fd_set* e, struct timeval64* tv) {
+    static select64_fn real;
+    if (!real) real = (select64_fn)dlsym(RTLD_NEXT, "__select64");
+    if (!real) return -1;
+    long t = tick();
+    if (t && nfds == 0 && !r && !w && !e && tv) {
+        long long us = tv->tv_sec * 1000000 + tv->tv_usec;
+        if (us > 0) {
+            long long up = round_up(us, t);
+            tv->tv_sec = up / 1000000;
+            tv->tv_usec = up % 1000000;
         }
     }
     return real(nfds, r, w, e, tv);
