@@ -628,6 +628,15 @@ sleep 1
 # Kill any stale wineserver left over from a previous container start.
 wineserver -k 2>/dev/null || true
 
+# Then start ONE persistent wineserver for everything below. Left to itself, the first `wine` call starts the server
+# with no persistence (`wineserver64 -p0`: it exits the instant its last client disconnects), and the short-lived
+# `wine reg add` calls below leave gaps with no client: the next call then connects to a server that is already
+# going away -> "wine client error:0: recvmsg: Connection reset by peer", `set -e` aborts, exit 1. Seen only on a
+# `docker restart` of a container that had run before (a fresh container's wineboot keeps a client connected), in
+# 1 of ~3 restarts, at a different reg call each time (2026-09-25, a /proc watcher showed the -p0 server). -p =
+# persist until killed; the cleanup trap's `wineserver -k` ends it with the container.
+wineserver -p
+
 # Honor caller-supplied WINEDEBUG (e.g. WINEDEBUG=+thread,+process for
 # diagnostics), otherwise silence Wine. Exporting it once means wineserver
 # and services.exe (spawned by the first `wine` call below) inherit it, and
