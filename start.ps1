@@ -688,6 +688,20 @@ Write-Host "Registering service: $serviceName -> $exePath"
 sc.exe delete $serviceName 2>$null | Out-Null
 sc.exe create $serviceName binPath= $exePath start= demand | Out-Null
 
+# A Windows service does NOT inherit this script's environment: SCM starts it with the machine environment plus the
+# service's own HKLM\...\Services\<name>\Environment (REG_MULTI_SZ "NAME=value" lines). Settings meant for the exe or
+# its hook plugins (FIESTA_CPUS for cpu_count, ...) therefore go there - without this they never arrived (2026-09-27:
+# a process-isolated DB bridge logged "24 CPU DETECTED" with FIESTA_CPUS=4 set on the container). Linux/Wine needs
+# nothing: Wine passes the environment through.
+$serviceEnv = @(Get-ChildItem Env: | Where-Object { $_.Name -like 'FIESTA_*' -and $_.Value -ne '' } |
+    Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" })
+if ($serviceEnv.Count -gt 0) {
+    $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+    for ($i = 0; $i -lt 15 -and -not (Test-Path $svcKey); $i++) { Start-Sleep -Seconds 1 }
+    New-ItemProperty -Path $svcKey -Name Environment -PropertyType MultiString -Value $serviceEnv -Force | Out-Null
+    Write-Host "  service environment: $($serviceEnv -join ', ')"
+}
+
 $maxWait = 15
 $service = $null
 for ($i = 0; $i -lt $maxWait; $i++) {
