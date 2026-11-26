@@ -38,6 +38,9 @@ rm -rf "${FIESTA_WORK:?}/$dir"
 mkdir -p "$FIESTA_WORK/$dir"
 # the exe folder's config and data (not old logs: they are rewritten anyway)
 cp -r "$FIESTA_PATH/$dir/." "$FIESTA_WORK/$dir/"
+# old logs that came with the folder: the container log follows this run's files only
+( cd "$FIESTA_WORK/$dir" && rm -rf DebugMessage && rm -f Assert*.txt ExitLog*.txt Message.txt MapLoad.txt Size.txt \
+    Dbg.txt *Log20*.txt *DumpStack*.txt *CallStack.txt KQLog*.txt )
 mkdir -p "$FIESTA_WORK/$dir/DebugMessage"
 
 # ServerInfo.txt: the LOCALHOST rows name the service, the PUBLIC_IP rows carry PUBLIC_IP
@@ -91,4 +94,43 @@ cp "$FIESTA_PATH/$dir/$exe" "/tmp/$exe"
 chmod +x "/tmp/$exe"
 cd "$FIESTA_WORK/$dir"
 echo "start-native: $FIESTA_EXE -> /tmp/$exe in $FIESTA_WORK/$dir"
-exec "/tmp/$exe"
+
+# The servers log to files, not stdout: follow them into the container log (kubectl logs / Freelens), each line
+# prefixed with its file. FIESTA_LOG_TAIL=0 turns it off. New files (the daily DebugMessage/Msg_<date>.txt, an
+# Assert*.txt) are picked up as they appear.
+log_files() {
+  for f in DebugMessage/Msg_*.txt Message.txt Assert*.txt ExitLog*.txt; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+follow_logs() {
+  seen=" "
+  while :; do
+    for f in $(log_files); do
+      case "$seen" in *" $f "*) continue ;; esac
+      seen="$seen$f "
+      tail -n +1 -F "$f" 2>/dev/null | sed -u "s|^|[$f] |" &
+    done
+    sleep 5
+  done
+}
+
+"/tmp/$exe" &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null' TERM INT
+if [ "${FIESTA_LOG_TAIL:-1}" != 0 ]; then
+  follow_logs &
+  follower=$!
+fi
+rc=0
+wait "$pid" || rc=$?
+# a TERM wakes wait early: wait again for the server itself
+while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
+sleep 2
+[ -n "${follower:-}" ] && kill "$follower" 2>/dev/null
+# whatever the server wrote at its very end (an Assert / ExitLog just before exiting) reaches the log
+for f in Assert*.txt ExitLog*.txt; do
+  [ -f "$f" ] && sed "s|^|[$f at exit] |" "$f"
+done
+echo "start-native: $FIESTA_EXE exited ($rc)"
+exit "$rc"
