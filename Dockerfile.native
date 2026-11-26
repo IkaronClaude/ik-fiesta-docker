@@ -1,0 +1,29 @@
+# Fiesta Online server runtime -- native x64 Linux (the fiesta-decomp linux-2026 build: no Wine, no proxy)
+#
+# Bring-your-own: NO game files and NO server binaries in the image. Mount the server tree read-only at /fiesta with
+# each native Linux binary next to its Windows exe, and say which server to run:
+#   docker run --rm -v /path/to/fiesta-server:/fiesta:ro -e FIESTA_EXE=Zone00/Zone.exe \
+#     -e INTERNAL_HOST_WorldManager_0=worldmanager ... registry.ikaron.uk/fiesta-server-runtime:deb-1
+# start-native.sh documents the settings. Tagged deb-* so it never collides with the Wine runtime's tags.
+
+# GCC 14's runtime libraries (the binaries are built with gcc:14; Debian's own libstdc++ is older)
+FROM gcc:14 AS gcc
+
+FROM debian:trixie-slim
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends unixodbc libltdl7 ca-certificates curl gnupg \
+    && rm -rf /var/lib/apt/lists/*
+# Microsoft's ODBC Driver 18 for SQL Server (the Linux servers use it; accepting its EULA is the operator's choice,
+# 2026-11-25). Debian 13 packages if published, else Debian 12's.
+RUN set -e; v=$(. /etc/os-release; echo $VERSION_ID); \
+    curl -fsSL -o /tmp/mp.deb https://packages.microsoft.com/config/debian/$v/packages-microsoft-prod.deb \
+      || curl -fsSL -o /tmp/mp.deb https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb; \
+    dpkg -i /tmp/mp.deb && rm /tmp/mp.deb && apt-get update && \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 && rm -rf /var/lib/apt/lists/*
+COPY --from=gcc /usr/local/lib64/libstdc++.so.6.0.33 /usr/local/lib64/libgcc_s.so.1 /usr/local/lib64/
+RUN ln -s libstdc++.so.6.0.33 /usr/local/lib64/libstdc++.so.6 && echo /usr/local/lib64 > /etc/ld.so.conf.d/gcc14.conf \
+    && ldconfig
+COPY start-native.sh /usr/local/bin/start-native.sh
+RUN chmod +x /usr/local/bin/start-native.sh
+ENV FIESTA_PATH=/fiesta FIESTA_WORK=/run/fiesta
+ENTRYPOINT ["/usr/local/bin/start-native.sh"]
